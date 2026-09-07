@@ -78,9 +78,7 @@ export function ConfigDialog({
       onSave({ apiUrl: apiUrl.trim(), module: module.trim() });
       onOpenChange(false);
     } catch (err) {
-      setTestError(
-        err instanceof Error ? err.message : String(err),
-      );
+      setTestError(err instanceof Error ? err.message : String(err));
     } finally {
       setTesting(false);
     }
@@ -120,7 +118,10 @@ export function ConfigDialog({
             />
             <datalist id="agent-module-options">
               {modules.map((m) => (
-                <option key={m.name} value={m.name}>
+                <option
+                  key={m.name}
+                  value={m.name}
+                >
                   {m.description}
                 </option>
               ))}

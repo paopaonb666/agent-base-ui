@@ -92,7 +92,11 @@ export function ChatInterface() {
           />
           <div className="flex items-center gap-2">
             {isLoading ? (
-              <Button type="button" variant="destructive" onClick={stream.stop}>
+              <Button
+                type="button"
+                variant="destructive"
+                onClick={stream.stop}
+              >
                 <CircleStop className="h-4 w-4" />
                 停止
               </Button>

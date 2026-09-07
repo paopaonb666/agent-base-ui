@@ -133,8 +133,9 @@ export async function listModules(args: {
   return Array.isArray(body.modules) ? body.modules : [];
 }
 
-/** Parse one SSE frame ("event: x\ndata: {...}") into a typed event. */
-function parseFrame(frame: string): AgentBaseEvent | null {
+/** Parse one SSE frame ("event: x\ndata: {...}") into a typed event.
+ * Exported for unit tests; treat as internal API. */
+export function parseFrame(frame: string): AgentBaseEvent | null {
   const lines = frame.split("\n");
   let eventName = "";
   const dataLines: string[] = [];
@@ -231,7 +232,10 @@ export async function* invokeAgent(
   let buffer = "";
   try {
     while (true) {
-      const { done, value } = await readChunkWithTimeout(reader, READ_TIMEOUT_MS);
+      const { done, value } = await readChunkWithTimeout(
+        reader,
+        READ_TIMEOUT_MS,
+      );
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let idx: number;

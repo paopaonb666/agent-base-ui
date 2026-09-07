@@ -1,4 +1,4 @@
-# Run formatting on all PRs
+# agent-base-ui 质量门：format / lint / typecheck / test / build + 拼写检查
 
 name: CI
 
@@ -55,6 +55,57 @@ jobs:
         run: pnpm install
       - name: Check linting
         run: pnpm lint
+
+  typecheck:
+    name: Type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.5.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22.x"
+          cache: "pnpm"
+      - name: Install dependencies
+        run: pnpm install
+      - name: Type check
+        run: pnpm typecheck
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.5.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22.x"
+          cache: "pnpm"
+      - name: Install dependencies
+        run: pnpm install
+      - name: Run unit tests
+        run: pnpm test
+
+  build:
+    name: Production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.5.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22.x"
+          cache: "pnpm"
+      - name: Install dependencies
+        run: pnpm install
+      - name: Build
+        run: pnpm build
 
   readme-spelling:
     name: Check README spelling

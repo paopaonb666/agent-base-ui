@@ -5,7 +5,7 @@ agent-base 的配套 Web 聊天界面（Next.js 16 + React 19 + TypeScript）。
 由 [LangChain agent-chat-ui](https://github.com/langchain-ai/agent-chat-ui) 深度改造而来：完全对接 agent-base
 的 SSE 事件契约，移除 LangGraph Server 协议与 langgraph-sdk 依赖，并整体改名为 **agent-base-ui**。
 
-> 后端在独立仓库 `agent-base`（`e:\ai_study\agent-base`）。本前端只与 agent-base 通信，不依赖其他后端。
+> 后端在独立仓库 `agent-base`（与本项目同级的独立仓库）。本前端只与 agent-base 通信，不依赖其他后端。
 
 ## 功能
 
@@ -23,12 +23,12 @@ agent-base 的配套 Web 聊天界面（Next.js 16 + React 19 + TypeScript）。
 
 ```bash
 # 1. 启动 agent-base 后端（默认 8000 端口）
-cd e:\ai_study\agent-base
+cd ../agent-base    # 任意你的 agent-base 克隆位置
 .venv\Scripts\activate            # 首次先按 agent-base/README.md 安装
 uvicorn agent_base.entrypoints.server:app --reload
 
 # 2. 启动本前端（另开终端）
-cd e:\ai_study\agent-base-ui
+cd agent-base-ui
 pnpm install
 pnpm dev                          # http://localhost:3000
 ```

@@ -35,15 +35,19 @@ export function ToolStep({
           <code className="text-sm font-medium text-gray-900">{name}</code>
           <span className="ml-auto text-xs text-gray-400">
             {(
-              { running: "运行中", completed: "已完成", error: "失败" } as Record<
-                string,
-                string
-              >
+              {
+                running: "运行中",
+                completed: "已完成",
+                error: "失败",
+              } as Record<string, string>
             )[status] ?? status}
           </span>
         </div>
         {detail ? (
-          <p className="mt-1 truncate text-xs text-gray-500" title={detail}>
+          <p
+            className="mt-1 truncate text-xs text-gray-500"
+            title={detail}
+          >
             {detail}
           </p>
         ) : null}
