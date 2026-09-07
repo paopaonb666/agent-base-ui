@@ -8,6 +8,7 @@ import {
   Dispatch,
   SetStateAction,
 } from "react";
+import { toast } from "sonner";
 
 // Conversation history stored in localStorage.
 //
@@ -31,6 +32,7 @@ export type ThreadMessage =
       role: "tool";
       name: string;
       status: "running" | "completed" | "error";
+      detail?: string;
     };
 
 export interface RecentThread {
@@ -67,11 +69,25 @@ function readThreads(): RecentThread[] {
   }
 }
 
+// Session-level dedup: a full quota would fail on *every* save — warn once
+// instead of toasting on each turn.
+let storageWarned = false;
+
 function writeThreads(threads: RecentThread[]): void {
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(threads));
   } catch {
-    // storage full / unavailable — best effort, history degrades silently
+    // storage full / unavailable — degrade, but make it visible (once).
+    if (!storageWarned) {
+      storageWarned = true;
+      toast.error("对话历史保存失败", {
+        description:
+          "浏览器存储空间已满或不可用，历史记录将停止更新。删除部分旧对话后可恢复。",
+        duration: 10000,
+        richColors: true,
+        closeButton: true,
+      });
+    }
   }
 }
 

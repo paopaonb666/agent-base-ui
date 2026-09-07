@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
-import { LoaderCircle, SendHorizontal } from "lucide-react";
+import { CircleStop, SendHorizontal } from "lucide-react";
 import { ChatMessage } from "./ChatMessage";
 import { useStreamContext } from "@/providers/Stream";
 
@@ -92,12 +92,9 @@ export function ChatInterface() {
           />
           <div className="flex items-center gap-2">
             {isLoading ? (
-              <Button
-                type="button"
-                disabled
-              >
-                <LoaderCircle className="h-4 w-4 animate-spin" />
-                运行中…
+              <Button type="button" variant="destructive" onClick={stream.stop}>
+                <CircleStop className="h-4 w-4" />
+                停止
               </Button>
             ) : (
               <Button

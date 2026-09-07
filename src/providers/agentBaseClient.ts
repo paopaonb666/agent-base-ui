@@ -84,6 +84,55 @@ export function requestId(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
+/** 单次 read 的最长等待。后端每 15s 发一个 ping；45s 内无任何事件
+ * （含心跳）即判定为断流——否则代理层静默断开时 UI 会永远"运行中"。 */
+const READ_TIMEOUT_MS = 45_000;
+
+/** 提取后端错误响应里可读的 detail（FastAPI 风格 {"detail": ...}）。 */
+async function extractErrorDetail(response: Response): Promise<string> {
+  try {
+    const body = (await response.json()) as { detail?: unknown };
+    if (typeof body.detail === "string") return body.detail;
+  } catch {
+    // non-JSON error body; keep the status text
+  }
+  return `HTTP ${response.status}`;
+}
+
+/** GET /health 的返回结构（分项健康，A4）。 */
+export interface HealthStatus {
+  status: string;
+  components: Record<string, string>;
+}
+
+/** 探测 agent-base 服务可达性（配置面板保存前调用）。 */
+export async function fetchHealth(args: {
+  apiUrl: string;
+  signal?: AbortSignal;
+}): Promise<HealthStatus> {
+  const url = `${args.apiUrl.replace(/\/+$/, "")}/health`;
+  const response = await fetch(url, { signal: args.signal });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  return (await response.json()) as HealthStatus;
+}
+
+export interface ModuleInfo {
+  name: string;
+  description: string;
+}
+
+/** 列出后端已注册的模块（配置面板下拉，免试错模块名）。 */
+export async function listModules(args: {
+  apiUrl: string;
+  signal?: AbortSignal;
+}): Promise<ModuleInfo[]> {
+  const url = `${args.apiUrl.replace(/\/+$/, "")}/v1/modules`;
+  const response = await fetch(url, { signal: args.signal });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  const body = (await response.json()) as { modules?: ModuleInfo[] };
+  return Array.isArray(body.modules) ? body.modules : [];
+}
+
 /** Parse one SSE frame ("event: x\ndata: {...}") into a typed event. */
 function parseFrame(frame: string): AgentBaseEvent | null {
   const lines = frame.split("\n");
@@ -182,7 +231,7 @@ export async function* invokeAgent(
   let buffer = "";
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readChunkWithTimeout(reader, READ_TIMEOUT_MS);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       let idx: number;
@@ -193,7 +242,37 @@ export async function* invokeAgent(
         if (event) yield event;
       }
     }
+  } catch (err) {
+    // 读超时/网络错误：取消底层流，触发服务端的"断连 => 取消 LLM"路径。
+    await reader.cancel().catch(() => {});
+    throw err;
   } finally {
     reader.releaseLock();
+  }
+}
+
+/** 带超时的单次 read；每个事件到达都会重置计时。 */
+async function readChunkWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `读超时：${timeoutMs / 1000} 秒内没有收到任何事件（含心跳），连接可能已被代理断开`,
+              ),
+            ),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }

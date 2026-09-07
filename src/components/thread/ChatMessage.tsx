@@ -17,6 +17,7 @@ export const ChatMessage = memo(function ChatMessage({
       <ToolStep
         name={message.name}
         status={message.status}
+        detail={message.detail}
       />
     );
   }

@@ -12,6 +12,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
+import {
+  fetchHealth,
+  listModules,
+  type ModuleInfo,
+} from "@/providers/agentBaseClient";
 
 export interface AppConfig {
   apiUrl: string;
@@ -33,18 +38,52 @@ export function ConfigDialog({
 }: ConfigDialogProps) {
   const [apiUrl, setApiUrl] = useState(initialConfig?.apiUrl || "");
   const [module, setModule] = useState(initialConfig?.module || "");
+  const [testing, setTesting] = useState(false);
+  const [testError, setTestError] = useState<string | null>(null);
+  const [modules, setModules] = useState<ModuleInfo[]>([]);
+
+  const savedApiUrl = initialConfig?.apiUrl ?? "";
 
   useEffect(() => {
     if (open && initialConfig) {
       setApiUrl(initialConfig.apiUrl);
       setModule(initialConfig.module);
+      setTestError(null);
     }
   }, [open, initialConfig]);
 
-  const handleSave = () => {
+  // 打开时尝试拉取已注册模块列表（失败不阻塞——输入框保留自由填写）。
+  useEffect(() => {
+    if (!open || !savedApiUrl) return;
+    let cancelled = false;
+    listModules({ apiUrl: savedApiUrl })
+      .then((mods) => {
+        if (!cancelled && mods.length > 0) setModules(mods);
+      })
+      .catch(() => {
+        // 模块列表不可用：保持自由输入。
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, savedApiUrl]);
+
+  const handleSave = async () => {
     if (!apiUrl.trim() || !module.trim()) return;
-    onSave({ apiUrl: apiUrl.trim(), module: module.trim() });
-    onOpenChange(false);
+    setTesting(true);
+    setTestError(null);
+    try {
+      // 保存前先探活：坏地址当场暴露，而不是第一次发消息时才报错。
+      await fetchHealth({ apiUrl: apiUrl.trim() });
+      onSave({ apiUrl: apiUrl.trim(), module: module.trim() });
+      onOpenChange(false);
+    } catch (err) {
+      setTestError(
+        err instanceof Error ? err.message : String(err),
+      );
+    } finally {
+      setTesting(false);
+    }
   };
 
   return (
@@ -77,8 +116,21 @@ export function ConfigDialog({
               placeholder="chat"
               value={module}
               onChange={(e) => setModule(e.target.value)}
+              list="agent-module-options"
             />
+            <datalist id="agent-module-options">
+              {modules.map((m) => (
+                <option key={m.name} value={m.name}>
+                  {m.description}
+                </option>
+              ))}
+            </datalist>
           </div>
+          {testError && (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">
+              连接测试失败：{testError}
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button
@@ -88,10 +140,10 @@ export function ConfigDialog({
             取消
           </Button>
           <Button
-            onClick={handleSave}
-            disabled={!apiUrl.trim() || !module.trim()}
+            onClick={() => void handleSave()}
+            disabled={testing || !apiUrl.trim() || !module.trim()}
           >
-            保存
+            {testing ? "测试连接中…" : "保存"}
           </Button>
         </DialogFooter>
       </DialogContent>
