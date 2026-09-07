@@ -7,7 +7,6 @@ import React, {
   useRef,
   useEffect,
 } from "react";
-import { useQueryState } from "nuqs";
 import { toast } from "sonner";
 import { useThreads, type ThreadMessage } from "./Thread";
 import {
@@ -32,6 +31,7 @@ export interface StreamState {
   apiUrl: string;
   setApiUrl: (value: string) => void;
   setModule: (value: string) => void;
+  setThreadId: (value: string | null) => void;
   sendMessage: (text: string) => Promise<void>;
   stop: () => void;
   resetThread: () => void;
@@ -69,46 +69,61 @@ function toUiMessage(message: ThreadHistoryMessage, index: number): UiMessage {
   };
 }
 
+// localStorage keys：配置与"最后活跃会话"都不进 URL——后端地址和
+// thread_id 出现在地址栏会随分享/浏览器历史泄露，而且 URL 参数会让
+// 任何人都可以指着一个任意后端。
+const API_URL_STORAGE_KEY = "agent-base-ui:apiUrl";
+const MODULE_STORAGE_KEY = "agent-base-ui:module";
+const LAST_THREAD_KEY = "agent-base-ui:lastThread";
+
+function readStorage(key: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStorage(key: string, value: string | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (value) window.localStorage.setItem(key, value);
+    else window.localStorage.removeItem(key);
+  } catch {
+    // 空间满/不可用：配置退化为进程内状态。
+  }
+}
+
 export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   children,
 }) => {
   const envApiUrl: string | undefined = process.env.NEXT_PUBLIC_API_URL;
   const envModule: string | undefined = process.env.NEXT_PUBLIC_AGENT_MODULE;
 
-  const [apiUrl, setApiUrl] = useQueryState("apiUrl", {
-    defaultValue: envApiUrl || "",
-  });
-  const [module, setModule] = useQueryState("module", {
-    defaultValue: envModule || "",
-  });
-  const [threadId, setThreadId] = useQueryState("threadId");
+  // 配置优先级：构建时 env > 用户保存的设置（localStorage）> 内置默认。
+  // 三者都不经过 URL。
+  const [apiUrl, setApiUrl] = useState<string>(
+    () => envApiUrl || readStorage(API_URL_STORAGE_KEY) || DEFAULT_API_URL,
+  );
+  const [module, setModule] = useState<string>(
+    () => envModule || readStorage(MODULE_STORAGE_KEY) || DEFAULT_MODULE,
+  );
+  const [threadId, setThreadId] = useState<string | null>(null);
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // apiUrl 的 localStorage 备份：URL 参数仍优先；用户手动输入的地址
-  // 跨标签页/清参数后不丢。
-  const API_URL_STORAGE_KEY = "agent-base-ui:apiUrl";
-  useEffect(() => {
-    if (apiUrl || typeof window === "undefined") return;
-    const cached = window.localStorage.getItem(API_URL_STORAGE_KEY);
-    if (cached) void setApiUrl(cached);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const updateApiUrl = useCallback((value: string) => {
+    setApiUrl(value);
+    writeStorage(API_URL_STORAGE_KEY, value);
   }, []);
-  const updateApiUrl = useCallback(
-    (value: string) => {
-      void setApiUrl(value);
-      if (typeof window !== "undefined") {
-        try {
-          if (value) window.localStorage.setItem(API_URL_STORAGE_KEY, value);
-          else window.localStorage.removeItem(API_URL_STORAGE_KEY);
-        } catch {
-          // 空间满/不可用：URL 参数仍可用，不阻塞配置。
-        }
-      }
-    },
-    [setApiUrl],
-  );
+
+  const updateThreadId = useCallback((value: string | null) => {
+    setThreadId(value);
+    // 记住最后活跃会话：下次打开首页直接恢复（后端 checkpointer 回放）。
+    writeStorage(LAST_THREAD_KEY, value);
+  }, []);
 
   // In-flight turn's abort controller — the "stop generating" button and any
   // thread switch abort it, which propagates to the backend and cancels the
@@ -117,8 +132,18 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
 
   const { saveThread, getThreadMessages, getThread } = useThreads();
 
-  const finalApiUrl = apiUrl || envApiUrl || DEFAULT_API_URL;
-  const finalModule = module || envModule || DEFAULT_MODULE;
+  const finalApiUrl = apiUrl;
+  const finalModule = module;
+
+  // 打开首页即恢复最后活跃会话（localStorage 里只有无敏感的 thread id；
+  // 对话内容本身由后端 checkpointer 持有，localStorage 没有就走历史
+  // 恢复路径拉取）。
+  useEffect(() => {
+    const savedModule = readStorage(MODULE_STORAGE_KEY);
+    if (savedModule) setModule(savedModule);
+    const saved = readStorage(LAST_THREAD_KEY);
+    if (saved) setThreadId(saved);
+  }, []);
 
   // refs so async closures read the latest value without re-creating
   const threadIdRef = useRef(threadId);
@@ -233,7 +258,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       // The transcript on screen now belongs to this thread id, so the
       // threadId effect must not treat it as a switch and reload.
       transcriptThread.current = turnThreadId;
-      setThreadId(turnThreadId);
+      updateThreadId(turnThreadId);
 
       let firstDeltaSeen = false;
       // 同名步骤在同一轮里可以出现多次（agent → tools → agent），
@@ -361,7 +386,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         }
       }
     },
-    [finalApiUrl, finalModule, isLoading, saveThread, setThreadId],
+    [finalApiUrl, finalModule, isLoading, saveThread, updateThreadId],
   );
 
   const stop = useCallback(() => {
@@ -373,8 +398,8 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     setMessages([]);
     setError(null);
     transcriptThread.current = null;
-    setThreadId(null);
-  }, [setThreadId]);
+    updateThreadId(null);
+  }, [updateThreadId]);
 
   // 模块切换后 thread 命名空间不同：沿用旧 thread_id 会在新模块下命中
   // 另一个（多半为空的）会话，上下文静默错位——因此换模块必须重置线程。
@@ -382,15 +407,16 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   const switchModule = useCallback(
     (value: string) => {
       setModule(value);
+      writeStorage(MODULE_STORAGE_KEY, value);
       if (value !== module) {
         abortRef.current?.abort();
         setMessages([]);
         setError(null);
         transcriptThread.current = null;
-        setThreadId(null);
+        updateThreadId(null);
       }
     },
-    [module, setModule, setThreadId],
+    [module, setModule, updateThreadId],
   );
 
   const value: StreamState = {
@@ -402,6 +428,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     apiUrl: finalApiUrl,
     setApiUrl: updateApiUrl,
     setModule: switchModule,
+    setThreadId: updateThreadId,
     sendMessage,
     stop,
     resetThread,

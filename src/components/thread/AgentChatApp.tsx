@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import { useQueryState } from "nuqs";
 import { Button } from "@/components/ui/button";
 import { MessagesSquare, Settings, SquarePen } from "lucide-react";
 import { ThreadList } from "./ThreadList";
@@ -11,7 +10,6 @@ import { useStreamContext } from "@/providers/Stream";
 
 export function AgentChatApp() {
   const stream = useStreamContext();
-  const [threadId, setThreadId] = useQueryState("threadId");
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [configOpen, setConfigOpen] = useState(false);
 
@@ -23,7 +21,7 @@ export function AgentChatApp() {
     module: string;
   }) => {
     stream.setModule(mod);
-    void setThreadId(id);
+    stream.setThreadId(id);
   };
 
   return (
@@ -55,7 +53,7 @@ export function AgentChatApp() {
               variant="outline"
               size="sm"
               onClick={() => stream.resetThread()}
-              disabled={!threadId}
+              disabled={!stream.threadId}
             >
               <SquarePen className="mr-2 h-4 w-4" />
               新建对话
@@ -69,7 +67,7 @@ export function AgentChatApp() {
               <ThreadList
                 onSelect={openThread}
                 onClose={() => setSidebarOpen(false)}
-                activeThreadId={threadId}
+                activeThreadId={stream.threadId}
               />
             </aside>
           )}

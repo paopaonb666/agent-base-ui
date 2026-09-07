@@ -12,7 +12,7 @@ agent-base 的配套 Web 聊天界面（Next.js 16 + React 19 + TypeScript）。
 - 与任意 agent-base 模块对话（chat / writer / supervisor …）
 - SSE 流式输出（delta 逐字渲染）+ 工具调用步骤展示（step 事件）
 - 会话历史（localStorage 本地索引 + 完整对话文本，点击即可切换并回放历史消息；续聊凭 thread_id 由后端 checkpointer 恢复上下文）
-- URL 参数化：`?apiUrl=&module=&threadId=`，便于分享与恢复
+- 会话持久化：打开首页自动恢复上次会话；对话内容存于后端 checkpointer，本地只留无敏感信息的线程索引
 
 ## 环境要求
 
@@ -34,7 +34,7 @@ pnpm dev                          # http://localhost:3000
 ```
 
 打开 http://localhost:3000 即可直接对话：默认连接 `http://localhost:8000` 的 `chat` 模块（或 writer /
-supervisor，需在 agent-base 的 `AGENT_MODULES` 中启用）。如需调整，用顶栏「设置」或 URL 参数覆盖。
+supervisor，需在 agent-base 的 `AGENT_MODULES` 中启用）。如需调整，用顶栏「设置」。
 二次启动只需重复第 1、2 步（无需再 install）。
 
 ## 配置（.env）
@@ -46,7 +46,7 @@ supervisor，需在 agent-base 的 `AGENT_MODULES` 中启用）。如需调整�
 | `NEXT_PUBLIC_API_URL`      | agent-base 服务地址（默认 http://localhost:8000） |
 | `NEXT_PUBLIC_AGENT_MODULE` | 默认模块（默认 chat）                             |
 
-配置缺省时前端回退到内置默认值（`http://localhost:8000` / `chat`），也可用顶栏「设置」或 URL 参数（`?apiUrl=`、`?module=`、`?threadId=`）覆盖。
+配置缺省时前端回退到内置默认值（`http://localhost:8000` / `chat`），也可用顶栏「设置」覆盖。后端地址 / 模块 / 会话 id 一律不出现在 URL——它们保存在浏览器 localStorage（仅本机）或构建时环境变量中，避免随链接分享或浏览器历史泄露。
 
 ## 常用命令
 
