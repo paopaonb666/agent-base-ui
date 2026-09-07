@@ -33,12 +33,9 @@ pnpm install
 pnpm dev                          # http://localhost:3000
 ```
 
-打开 http://localhost:3000，设置页填入：
-
-- **agent-base server URL**：`http://localhost:8000`
-- **Agent module**：`chat`（或 writer / supervisor，需在 agent-base 的 `AGENT_MODULES` 中启用）
-
-即可开始对话。二次启动只需重复第 1、2 步（无需再 install）。
+打开 http://localhost:3000 即可直接对话：默认连接 `http://localhost:8000` 的 `chat` 模块（或 writer /
+supervisor，需在 agent-base 的 `AGENT_MODULES` 中启用）。如需调整，用顶栏「设置」或 URL 参数覆盖。
+二次启动只需重复第 1、2 步（无需再 install）。
 
 ## 配置（.env）
 
@@ -49,7 +46,7 @@ pnpm dev                          # http://localhost:3000
 | `NEXT_PUBLIC_API_URL`      | agent-base 服务地址（默认 http://localhost:8000） |
 | `NEXT_PUBLIC_AGENT_MODULE` | 默认模块（默认 chat）                             |
 
-配置缺省时前端会显示设置表单，也可用 URL 参数（`?apiUrl=`、`?module=`、`?threadId=`）临时覆盖。
+配置缺省时前端回退到内置默认值（`http://localhost:8000` / `chat`），也可用顶栏「设置」或 URL 参数（`?apiUrl=`、`?module=`、`?threadId=`）覆盖。
 
 ## 常用命令
 
@@ -83,8 +80,7 @@ agent-base-ui/
 │   │   ├── ThreadList.tsx      # 对话列表（按时间分组 / 删除）
 │   │   ├── ChatInterface.tsx   # 消息流 + 底部输入框
 │   │   ├── ChatMessage.tsx     # 用户气泡 / AI Markdown / 工具步骤
-│   │   ├── ConfigDialog.tsx    # 设置弹窗
-│   │   ├── SetupScreen.tsx     # 首次配置欢迎页
+│   │   ├── ConfigDialog.tsx    # 设置弹窗（服务地址 / 模块）
 │   │   └── markdown-text.tsx   # Markdown 渲染（代码高亮 / KaTeX）
 │   ├── components/ui/          # UI 原语（button / dialog / input …）
 │   └── app/                    # Next.js 布局与页面

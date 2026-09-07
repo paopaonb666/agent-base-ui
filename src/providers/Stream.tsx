@@ -17,8 +17,6 @@ import {
   requestId,
   type ThreadHistoryMessage,
 } from "./agentBaseClient";
-import { SetupScreen } from "@/components/thread/SetupScreen";
-
 // UI message model — minimal by design:
 // agent-base streams plain text deltas and node steps, nothing richer.
 // The same shape is persisted per-thread in Thread.tsx so a past conversation
@@ -41,6 +39,7 @@ export interface StreamState {
 
 const StreamContext = createContext<StreamState | undefined>(undefined);
 
+// URL 参数与环境变量都缺省时的兜底配置，保证无配置也能直接进入聊天。
 const DEFAULT_API_URL = "http://localhost:8000";
 const DEFAULT_MODULE = "chat"; // chat | writer | supervisor
 
@@ -118,8 +117,8 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
 
   const { saveThread, getThreadMessages, getThread } = useThreads();
 
-  const finalApiUrl = apiUrl || envApiUrl;
-  const finalModule = module || envModule;
+  const finalApiUrl = apiUrl || envApiUrl || DEFAULT_API_URL;
+  const finalModule = module || envModule || DEFAULT_MODULE;
 
   // refs so async closures read the latest value without re-creating
   const threadIdRef = useRef(threadId);
@@ -146,6 +145,10 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     // 切换线程：进行中的流仍属于旧线程（会覆盖视图、无法停止）——
     // abort 它，同时触发后端的断连取消。
     abortRef.current?.abort();
+    // 记住进入前的值：cleanup 时回滚。React StrictMode（开发模式）会
+    // 双执行 effect——如果不回滚，第二次执行会因 ref 已等于 target 而
+    // 早退，第一次启动的 fetch 又被 cleanup 取消，历史恢复整体失效。
+    const previousThread = transcriptThread.current;
     transcriptThread.current = target;
     setError(null);
 
@@ -199,6 +202,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     })();
     return () => {
       cancelled = true;
+      transcriptThread.current = previousThread;
     };
   }, [threadId, getThreadMessages, getThread, finalApiUrl, finalModule]);
 
@@ -388,20 +392,6 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     },
     [module, setModule, setThreadId],
   );
-
-  // Setup gate: require both a backend URL and a module before chatting.
-  if (!finalApiUrl || !finalModule) {
-    return (
-      <SetupScreen
-        defaultApiUrl={apiUrl || DEFAULT_API_URL}
-        defaultModule={module || DEFAULT_MODULE}
-        onSave={(c) => {
-          setApiUrl(c.apiUrl);
-          setModule(c.module);
-        }}
-      />
-    );
-  }
 
   const value: StreamState = {
     messages,
