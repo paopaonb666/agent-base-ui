@@ -41,6 +41,8 @@ export interface RecentThread {
   module: string;
   updatedAt: number;
   messages?: ThreadMessage[];
+  /** 来自后端 checkpointer 的线程（本地无 transcript，点击走历史恢复）。 */
+  remote?: boolean;
 }
 
 interface ThreadContextType {

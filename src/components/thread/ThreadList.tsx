@@ -1,12 +1,14 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { format } from "date-fns";
-import { Loader2, MessageSquare, Trash2, X } from "lucide-react";
+import { Cloud, Loader2, MessageSquare, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { useThreads, type RecentThread } from "@/providers/Thread";
+import { listThreads } from "@/providers/agentBaseClient";
+import { useStreamContext } from "@/providers/Stream";
 
 const GROUP_LABELS = {
   today: "今天",
@@ -37,7 +39,46 @@ export function ThreadList({
   activeThreadId,
 }: ThreadListProps) {
   const { threads, removeThread, threadsLoading } = useThreads();
+  const stream = useStreamContext();
+  const [remoteThreads, setRemoteThreads] = useState<RecentThread[]>([]);
+  const [remoteLoading, setRemoteLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  // 云端线程：checkpointer 里该模块命名空间下已持久化的会话。本地索引
+  // 只覆盖"在这台浏览器上聊过"的线程；同一 threadId 本地优先。
+  useEffect(() => {
+    if (!stream.apiUrl || !stream.module) return;
+    let cancelled = false;
+    setRemoteLoading(true);
+    listThreads({ apiUrl: stream.apiUrl, module: stream.module })
+      .then((items) => {
+        if (cancelled) return;
+        setRemoteThreads(
+          items.map((it) => ({
+            threadId: it.thread_id,
+            title: it.title,
+            module: it.module,
+            updatedAt: it.updated_at,
+            remote: true,
+          })),
+        );
+      })
+      .catch(() => {
+        // 后端不可达 / 端点缺失：侧栏退化为只显示本地索引。
+        if (!cancelled) setRemoteThreads([]);
+      })
+      .finally(() => {
+        if (!cancelled) setRemoteLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [stream.apiUrl, stream.module]);
+
+  const merged = useMemo(() => {
+    const seen = new Set(threads.map((t) => t.threadId));
+    return [...threads, ...remoteThreads.filter((r) => !seen.has(r.threadId))];
+  }, [threads, remoteThreads]);
 
   const grouped = useMemo(() => {
     const now = new Date();
@@ -48,7 +89,7 @@ export function ThreadList({
       older: [],
     };
 
-    threads.forEach((thread) => {
+    merged.forEach((thread) => {
       const diff = now.getTime() - thread.updatedAt;
       const days = Math.floor(diff / (1000 * 60 * 60 * 24));
       if (days === 0) groups.today.push(thread);
@@ -58,7 +99,7 @@ export function ThreadList({
     });
 
     return groups;
-  }, [threads]);
+  }, [merged]);
 
   const handleDelete = (threadId: string) => {
     if (!window.confirm("确定要删除这条对话吗？此操作无法撤销。")) return;
@@ -85,7 +126,7 @@ export function ThreadList({
       </div>
 
       <div className="h-0 flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-gray-300 [&::-webkit-scrollbar-track]:bg-transparent">
-        {threadsLoading ? (
+        {threadsLoading || (remoteLoading && merged.length === 0) ? (
           <div className="space-y-2 p-4">
             {Array.from({ length: 5 }).map((_, i) => (
               <Skeleton
@@ -94,7 +135,7 @@ export function ThreadList({
               />
             ))}
           </div>
-        ) : threads.length === 0 ? (
+        ) : merged.length === 0 ? (
           <div className="flex flex-col items-center justify-center p-8 text-center">
             <MessageSquare className="mb-2 h-12 w-12 text-gray-300" />
             <p className="text-muted-foreground text-sm">暂无对话</p>
@@ -138,8 +179,13 @@ export function ThreadList({
                         >
                           <div className="min-w-0 flex-1">
                             <div className="mb-1 flex items-center justify-between">
-                              <h3 className="truncate text-sm font-semibold">
-                                {thread.title || thread.threadId}
+                              <h3 className="flex min-w-0 items-center gap-1.5 truncate text-sm font-semibold">
+                                <span className="truncate">
+                                  {thread.title || thread.threadId}
+                                </span>
+                                {thread.remote && (
+                                  <Cloud className="text-muted-foreground h-3.5 w-3.5 flex-shrink-0" />
+                                )}
                               </h3>
                               <span className="text-muted-foreground ml-2 flex-shrink-0 text-xs">
                                 {formatTime(new Date(thread.updatedAt))}
@@ -152,24 +198,26 @@ export function ThreadList({
                             </div>
                           </div>
                         </button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            handleDelete(thread.threadId);
-                          }}
-                          disabled={deletingId === thread.threadId}
-                          title="删除对话"
-                        >
-                          {deletingId === thread.threadId ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            <Trash2 className="text-muted-foreground hover:text-destructive h-3.5 w-3.5" />
-                          )}
-                        </Button>
+                        {!thread.remote && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              handleDelete(thread.threadId);
+                            }}
+                            disabled={deletingId === thread.threadId}
+                            title="删除对话"
+                          >
+                            {deletingId === thread.threadId ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Trash2 className="text-muted-foreground hover:text-destructive h-3.5 w-3.5" />
+                            )}
+                          </Button>
+                        )}
                       </div>
                     ))}
                   </div>

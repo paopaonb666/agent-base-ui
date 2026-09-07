@@ -133,6 +133,27 @@ export async function listModules(args: {
   return Array.isArray(body.modules) ? body.modules : [];
 }
 
+/** GET /v1/agents/{module}/threads 返回的一条线程摘要。 */
+export interface RemoteThreadSummary {
+  thread_id: string;
+  module: string;
+  title: string;
+  updated_at: number;
+}
+
+/** 列出某模块在 checkpointer 里已持久化的线程（侧栏"云端会话"来源）。 */
+export async function listThreads(args: {
+  apiUrl: string;
+  module: string;
+  signal?: AbortSignal;
+}): Promise<RemoteThreadSummary[]> {
+  const url = `${args.apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(args.module)}/threads`;
+  const response = await fetch(url, { signal: args.signal });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  const body = (await response.json()) as { threads?: RemoteThreadSummary[] };
+  return Array.isArray(body.threads) ? body.threads : [];
+}
+
 /** Parse one SSE frame ("event: x\ndata: {...}") into a typed event.
  * Exported for unit tests; treat as internal API. */
 export function parseFrame(frame: string): AgentBaseEvent | null {
