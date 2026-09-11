@@ -6,7 +6,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeKatex from "rehype-katex";
 import remarkMath from "remark-math";
-import { FC, memo, useState } from "react";
+import { FC, memo, useRef, useState, type ReactNode } from "react";
 import { CheckIcon, CopyIcon } from "lucide-react";
 import { SyntaxHighlighter } from "@/components/thread/syntax-highlighter";
 
@@ -14,11 +14,6 @@ import { TooltipIconButton } from "@/components/thread/tooltip-icon-button";
 import { cn } from "@/lib/utils";
 
 import "katex/dist/katex.min.css";
-
-interface CodeHeaderProps {
-  language?: string;
-  code: string;
-}
 
 const useCopyToClipboard = ({
   copiedDuration = 3000,
@@ -39,23 +34,44 @@ const useCopyToClipboard = ({
   return { isCopied, copyToClipboard };
 };
 
-const CodeHeader: FC<CodeHeaderProps> = ({ language, code }) => {
+// 围栏代码块外壳：头部（语言标签 + 复制按钮）+ 代码主体。带语言时走
+// 语法高亮（源码取自子 code 元素的文本），否则退化为纯文本块——复制
+// 内容从 DOM textContent 读取，对两条路径同样可靠。
+const CodeBlock: FC<{
+  language?: string;
+  code: string;
+  children: ReactNode;
+}> = ({ language, code, children }) => {
   const { isCopied, copyToClipboard } = useCopyToClipboard();
+  const contentRef = useRef<HTMLDivElement>(null);
   const onCopy = () => {
-    if (!code || isCopied) return;
-    copyToClipboard(code);
+    const text = contentRef.current?.textContent ?? code;
+    if (!text || isCopied) return;
+    copyToClipboard(text);
   };
 
   return (
-    <div className="flex items-center justify-between gap-4 rounded-t-lg bg-zinc-900 px-4 py-2 text-sm font-semibold text-white">
-      <span className="lowercase [&>span]:text-xs">{language}</span>
-      <TooltipIconButton
-        tooltip="Copy"
-        onClick={onCopy}
-      >
-        {!isCopied && <CopyIcon />}
-        {isCopied && <CheckIcon />}
-      </TooltipIconButton>
+    <div className="my-4 max-w-4xl overflow-hidden rounded-lg bg-black text-white">
+      <div className="flex items-center justify-between gap-4 bg-zinc-900 px-4 py-2 text-sm font-semibold">
+        <span className="lowercase text-zinc-300">{language ?? "text"}</span>
+        <TooltipIconButton
+          tooltip="Copy"
+          onClick={onCopy}
+          aria-label="复制代码"
+        >
+          {!isCopied && <CopyIcon />}
+          {isCopied && <CheckIcon />}
+        </TooltipIconButton>
+      </div>
+      <div ref={contentRef}>
+        {language && code ? (
+          <SyntaxHighlighter language={language}>
+            {code.replace(/\n$/, "")}
+          </SyntaxHighlighter>
+        ) : (
+          <pre className="overflow-x-auto p-4 text-sm leading-6">{children}</pre>
+        )}
+      </div>
     </div>
   );
 };
@@ -193,45 +209,39 @@ const defaultComponents: any = {
       {...props}
     />
   ),
-  pre: ({ className, ...props }: { className?: string }) => (
-    <pre
-      className={cn(
-        "max-w-4xl overflow-x-auto rounded-lg bg-black text-white",
-        className,
-      )}
-      {...props}
-    />
-  ),
+  pre: ({ children }: { children?: ReactNode }) => {
+    // 统一的围栏代码块外壳：头部（语言 + 复制）对带语言和不带语言的块
+    // 一视同仁。旧实现只在 code 带 language-xxx 时渲染头部，无语言标注
+    // 的块（``` 直接开栏）没有复制按钮。语言与源码从子 code 元素提取。
+    const first = Array.isArray(children) ? children[0] : children;
+    const childProps =
+      typeof first === "object" && first !== null && "props" in first
+        ? (first as { props?: { className?: string; children?: unknown } })
+            .props ?? {}
+        : {};
+    const language = /language-([\w-]+)/.exec(childProps.className ?? "")?.[1];
+    const code =
+      typeof childProps.children === "string" ? childProps.children : "";
+    return (
+      <CodeBlock
+        language={language}
+        code={code}
+      >
+        {children}
+      </CodeBlock>
+    );
+  },
   code: ({
     className,
     children,
     ...props
   }: {
     className?: string;
-    children: React.ReactNode;
+    children: ReactNode;
   }) => {
-    const match = /language-(\w+)/.exec(className || "");
-
-    if (match) {
-      const language = match[1];
-      const code = String(children).replace(/\n$/, "");
-
-      return (
-        <>
-          <CodeHeader
-            language={language}
-            code={code}
-          />
-          <SyntaxHighlighter
-            language={language}
-            className={className}
-          >
-            {code}
-          </SyntaxHighlighter>
-        </>
-      );
-    }
-
+    // 带语言的块由 CodeBlock 外壳负责头部/复制/高亮（见 pre 覆写），
+    // 这里只处理无语言标注的情形：出现在段落里是行内代码，出现在
+    // CodeBlock 里则是纯文本块。
     return (
       <code
         className={cn("rounded font-semibold", className)}

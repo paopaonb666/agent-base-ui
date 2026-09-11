@@ -64,14 +64,7 @@ export async function fetchThreadHistory(args: {
   const url = `${apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(module)}/threads/${encodeURIComponent(threadId)}`;
   const response = await fetch(url, { signal });
   if (!response.ok) {
-    let detail = `HTTP ${response.status}`;
-    try {
-      const body = await response.json();
-      if (typeof body.detail === "string") detail = body.detail;
-    } catch {
-      // non-JSON error body; keep the status text
-    }
-    throw new Error(detail);
+    throw new Error(await extractErrorDetail(response));
   }
   return (await response.json()) as ThreadHistory;
 }
@@ -88,11 +81,27 @@ export function requestId(): string {
  * （含心跳）即判定为断流——否则代理层静默断开时 UI 会永远"运行中"。 */
 const READ_TIMEOUT_MS = 45_000;
 
-/** 提取后端错误响应里可读的 detail（FastAPI 风格 {"detail": ...}）。 */
-async function extractErrorDetail(response: Response): Promise<string> {
+/** 提取后端错误响应里可读的 detail（FastAPI 风格 {"detail": ...}）。
+ * 422 校验错误的 detail 是数组，逐条格式化成 "消息 (字段路径)"。 */
+export async function extractErrorDetail(response: Response): Promise<string> {
   try {
     const body = (await response.json()) as { detail?: unknown };
     if (typeof body.detail === "string") return body.detail;
+    if (Array.isArray(body.detail)) {
+      const lines = body.detail
+        .map((item) => {
+          if (typeof item !== "object" || item === null) return String(item);
+          const { msg, loc } = item as { msg?: unknown; loc?: unknown };
+          const where = Array.isArray(loc) ? loc.join(".") : "";
+          return typeof msg === "string" && where
+            ? `${msg}（${where}）`
+            : typeof msg === "string"
+              ? msg
+              : String(item);
+        })
+        .filter(Boolean);
+      if (lines.length > 0) return lines.join("；");
+    }
   } catch {
     // non-JSON error body; keep the status text
   }
@@ -152,6 +161,21 @@ export async function listThreads(args: {
   if (!response.ok) throw new Error(await extractErrorDetail(response));
   const body = (await response.json()) as { threads?: RemoteThreadSummary[] };
   return Array.isArray(body.threads) ? body.threads : [];
+}
+
+/** 删除某模块命名空间下的一个已持久化线程（后端 checkpointer 同步删除）。 */
+export async function deleteThread(args: {
+  apiUrl: string;
+  module: string;
+  threadId: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const url = `${args.apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(args.module)}/threads/${encodeURIComponent(args.threadId)}`;
+  const response = await fetch(url, {
+    method: "DELETE",
+    signal: args.signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
 }
 
 /** Parse one SSE frame ("event: x\ndata: {...}") into a typed event.
@@ -234,14 +258,7 @@ export async function* invokeAgent(
   });
 
   if (!response.ok) {
-    let detail = `HTTP ${response.status}`;
-    try {
-      const body = await response.json();
-      if (typeof body.detail === "string") detail = body.detail;
-    } catch {
-      // non-JSON error body; keep the status text
-    }
-    throw new Error(detail);
+    throw new Error(await extractErrorDetail(response));
   }
 
   if (!response.body) {

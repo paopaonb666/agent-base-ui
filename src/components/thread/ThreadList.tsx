@@ -1,14 +1,15 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { format } from "date-fns";
 import { Cloud, Loader2, MessageSquare, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { useThreads, type RecentThread } from "@/providers/Thread";
-import { listThreads } from "@/providers/agentBaseClient";
+import { deleteThread, listThreads } from "@/providers/agentBaseClient";
 import { useStreamContext } from "@/providers/Stream";
+import { toast } from "sonner";
 
 const GROUP_LABELS = {
   today: "今天",
@@ -43,37 +44,45 @@ export function ThreadList({
   const [remoteThreads, setRemoteThreads] = useState<RecentThread[]>([]);
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [remoteVersion, setRemoteVersion] = useState(0);
 
   // 云端线程：checkpointer 里该模块命名空间下已持久化的会话。本地索引
   // 只覆盖"在这台浏览器上聊过"的线程；同一 threadId 本地优先。
+  const refreshRemote = useCallback(
+    (signal: { cancelled: boolean }) => {
+      if (!stream.apiUrl || !stream.module) return;
+      setRemoteLoading(true);
+      listThreads({ apiUrl: stream.apiUrl, module: stream.module })
+        .then((items) => {
+          if (signal.cancelled) return;
+          setRemoteThreads(
+            items.map((it) => ({
+              threadId: it.thread_id,
+              title: it.title,
+              module: it.module,
+              updatedAt: it.updated_at,
+              remote: true,
+            })),
+          );
+        })
+        .catch(() => {
+          // 后端不可达 / 端点缺失：侧栏退化为只显示本地索引。
+          if (!signal.cancelled) setRemoteThreads([]);
+        })
+        .finally(() => {
+          if (!signal.cancelled) setRemoteLoading(false);
+        });
+    },
+    [stream.apiUrl, stream.module],
+  );
+
   useEffect(() => {
-    if (!stream.apiUrl || !stream.module) return;
-    let cancelled = false;
-    setRemoteLoading(true);
-    listThreads({ apiUrl: stream.apiUrl, module: stream.module })
-      .then((items) => {
-        if (cancelled) return;
-        setRemoteThreads(
-          items.map((it) => ({
-            threadId: it.thread_id,
-            title: it.title,
-            module: it.module,
-            updatedAt: it.updated_at,
-            remote: true,
-          })),
-        );
-      })
-      .catch(() => {
-        // 后端不可达 / 端点缺失：侧栏退化为只显示本地索引。
-        if (!cancelled) setRemoteThreads([]);
-      })
-      .finally(() => {
-        if (!cancelled) setRemoteLoading(false);
-      });
+    const signal = { cancelled: false };
+    refreshRemote(signal);
     return () => {
-      cancelled = true;
+      signal.cancelled = true;
     };
-  }, [stream.apiUrl, stream.module]);
+  }, [refreshRemote, remoteVersion]);
 
   const merged = useMemo(() => {
     const seen = new Set(threads.map((t) => t.threadId));
@@ -101,11 +110,28 @@ export function ThreadList({
     return groups;
   }, [merged]);
 
-  const handleDelete = (threadId: string) => {
+  const handleDelete = (thread: RecentThread) => {
     if (!window.confirm("确定要删除这条对话吗？此操作无法撤销。")) return;
-    setDeletingId(threadId);
-    removeThread(threadId);
-    setDeletingId(null);
+    setDeletingId(thread.threadId);
+    // 同步删除后端 checkpointer 里的线程：只删本地索引的话，清缓存/
+    // 换设备后会"复活"。后端失败不阻塞本地删除（离线也要能整理列表），
+    // 但要给出可见的提示；成功后刷新云端列表，避免侧栏残留旧条目。
+    removeThread(thread.threadId);
+    deleteThread({
+      apiUrl: stream.apiUrl,
+      module: thread.module,
+      threadId: thread.threadId,
+    })
+      .then(() => setRemoteVersion((v) => v + 1))
+      .catch(() => {
+        toast.error("云端会话删除失败", {
+          description: "本地已移除，但服务端仍保留这条对话（清缓存后会重新出现）。",
+          duration: 8000,
+          richColors: true,
+          closeButton: true,
+        });
+      })
+      .finally(() => setDeletingId(null));
   };
 
   return (
@@ -198,26 +224,26 @@ export function ThreadList({
                             </div>
                           </div>
                         </button>
-                        {!thread.remote && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
-                            onClick={(e) => {
-                              e.preventDefault();
-                              e.stopPropagation();
-                              handleDelete(thread.threadId);
-                            }}
-                            disabled={deletingId === thread.threadId}
-                            title="删除对话"
-                          >
-                            {deletingId === thread.threadId ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            ) : (
-                              <Trash2 className="text-muted-foreground hover:text-destructive h-3.5 w-3.5" />
-                            )}
-                          </Button>
+                        {/* 本地与纯云端线程都可删除：只允许删本地会让
+                            换浏览器/清缓存后的云端会话变成不可管理。 */}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-6 shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            handleDelete(thread);
+                          }}
+                          disabled={deletingId === thread.threadId}
+                          title="删除对话"
+                        >
+                        {deletingId === thread.threadId ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="text-muted-foreground hover:text-destructive h-3.5 w-3.5" />
                         )}
+                      </Button>
                       </div>
                     ))}
                   </div>

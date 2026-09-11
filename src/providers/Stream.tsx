@@ -22,6 +22,12 @@ import {
 // can be reopened from the history sidebar.
 export type UiMessage = ThreadMessage;
 
+export interface SendMessageResult {
+  ok: boolean;
+  /** 调用方在失败时应把这份草稿放回输入框，避免用户长文本丢失。 */
+  draft: string;
+}
+
 export interface StreamState {
   messages: UiMessage[];
   isLoading: boolean;
@@ -32,7 +38,7 @@ export interface StreamState {
   setApiUrl: (value: string) => void;
   setModule: (value: string) => void;
   setThreadId: (value: string | null) => void;
-  sendMessage: (text: string) => Promise<void>;
+  sendMessage: (text: string) => Promise<SendMessageResult>;
   stop: () => void;
   resetThread: () => void;
 }
@@ -70,8 +76,9 @@ function toUiMessage(message: ThreadHistoryMessage, index: number): UiMessage {
 }
 
 // localStorage keys：配置与"最后活跃会话"都不进 URL——后端地址和
-// thread_id 出现在地址栏会随分享/浏览器历史泄露，而且 URL 参数会让
-// 任何人都可以指着一个任意后端。
+// thread_id 出现在地址栏会随分享/浏览器历史泄露。
+// 例外：?apiUrl= / ?module= 是 .env.example 明文支持的契约，优先级
+// URL > 构建时 env > 用户保存的设置 > 内置默认；URL 参数不会落库。
 const API_URL_STORAGE_KEY = "agent-base-ui:apiUrl";
 const MODULE_STORAGE_KEY = "agent-base-ui:module";
 const LAST_THREAD_KEY = "agent-base-ui:lastThread";
@@ -95,24 +102,48 @@ function writeStorage(key: string, value: string | null): void {
   }
 }
 
+/** .env.example 契约：?apiUrl= / ?module= URL 参数覆盖保存的设置（不落库）。 */
+function readUrlOverride(key: "apiUrl" | "module"): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const value = new URLSearchParams(window.location.search).get(key);
+    return value && value.trim() ? value.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   children,
 }) => {
   const envApiUrl: string | undefined = process.env.NEXT_PUBLIC_API_URL;
   const envModule: string | undefined = process.env.NEXT_PUBLIC_AGENT_MODULE;
+  // 只在首次渲染求值一次，供 hydrate effect 判断优先级。
+  const [urlApiUrl] = useState(() => readUrlOverride("apiUrl"));
+  const [urlModule] = useState(() => readUrlOverride("module"));
 
-  // 配置优先级：构建时 env > 用户保存的设置（localStorage）> 内置默认。
-  // 三者都不经过 URL。
   const [apiUrl, setApiUrl] = useState<string>(
-    () => envApiUrl || readStorage(API_URL_STORAGE_KEY) || DEFAULT_API_URL,
+    () =>
+      readUrlOverride("apiUrl") ||
+      envApiUrl ||
+      readStorage(API_URL_STORAGE_KEY) ||
+      DEFAULT_API_URL,
   );
   const [module, setModule] = useState<string>(
-    () => envModule || readStorage(MODULE_STORAGE_KEY) || DEFAULT_MODULE,
+    () =>
+      readUrlOverride("module") ||
+      envModule ||
+      readStorage(MODULE_STORAGE_KEY) ||
+      DEFAULT_MODULE,
   );
   const [threadId, setThreadId] = useState<string | null>(null);
+  // 当前渲染的转写 —— 永远等于活跃线程的 transcriptsRef[activeThreadId]。
   const [messages, setMessages] = useState<UiMessage[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 正在进行中的对话轮（按线程）：ref 供 sendMessage 守卫同步读取，
+  // trigger 只用于在流开始/结束时触发重算 isLoading。
+  const streamingRef = useRef<Set<string>>(new Set());
+  const [streamingTrigger, setStreamingTrigger] = useState(0);
 
   const updateApiUrl = useCallback((value: string) => {
     setApiUrl(value);
@@ -125,10 +156,47 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     writeStorage(LAST_THREAD_KEY, value);
   }, []);
 
-  // In-flight turn's abort controller — the "stop generating" button and any
-  // thread switch abort it, which propagates to the backend and cancels the
-  // LLM call (client disconnect => cancellation).
-  const abortRef = useRef<AbortController | null>(null);
+  // In-flight turn's abort controller per thread —— “停止生成”只中止当前
+  // 会话的流；切换会话不影响后台流（事件按线程路由，见 transcriptsRef）。
+  const abortRefs = useRef<Map<string, AbortController>>(new Map());
+
+  // 每个线程的权威转写（内存）。流事件永远写入这里；只有当该线程正是
+  // 活跃线程时才同步到渲染状态。这是修复"切换/停止/刷新丢消息"的核心：
+  // 流的生命周期与视图彻底解耦。
+  const transcriptsRef = useRef<Map<string, UiMessage[]>>(new Map());
+  // 活跃线程镜像（effect 里同步），供异步回调判断"该不该更新视图"。
+  const activeThreadRef = useRef<string | null>(null);
+  useEffect(() => {
+    activeThreadRef.current = threadId;
+  }, [threadId]);
+  // sendMessage 的稳定闭包里读不到最新 threadId（它不在依赖数组里），
+  // 必须走 ref：否则"新建对话"后发的第一轮会被路由进旧线程的转写。
+  const threadIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    threadIdRef.current = threadId;
+  }, [threadId]);
+
+  // 当前渲染转写的镜像：sendMessage 以它兜底 seed，避免闭包过期。
+  const messagesRef = useRef<UiMessage[]>([]);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  const setTranscript = useCallback(
+    (id: string, next: UiMessage[]) => {
+      // 刷新插入顺序，配合下方淘汰策略限制内存。
+      transcriptsRef.current.delete(id);
+      transcriptsRef.current.set(id, next);
+      if (transcriptsRef.current.size > 50) {
+        const oldest = transcriptsRef.current.keys().next().value;
+        if (oldest !== undefined && oldest !== id) {
+          transcriptsRef.current.delete(oldest);
+        }
+      }
+      if (activeThreadRef.current === id) setMessages(next);
+    },
+    [],
+  );
 
   const { saveThread, getThreadMessages, getThread } = useThreads();
 
@@ -137,65 +205,41 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
 
   // 打开首页即恢复最后活跃会话（localStorage 里只有无敏感的 thread id；
   // 对话内容本身由后端 checkpointer 持有，localStorage 没有就走历史
-  // 恢复路径拉取）。
+  // 恢复路径拉取）。注意不覆盖 URL 参数/构建时 env 的初始值——它们的
+  // 优先级更高（见 .env.example 契约）。
   useEffect(() => {
-    const savedModule = readStorage(MODULE_STORAGE_KEY);
-    if (savedModule) setModule(savedModule);
+    if (!urlModule) {
+      const savedModule = readStorage(MODULE_STORAGE_KEY);
+      if (savedModule) setModule(savedModule);
+    }
     const saved = readStorage(LAST_THREAD_KEY);
     if (saved) setThreadId(saved);
   }, []);
 
-  // refs so async closures read the latest value without re-creating
-  const threadIdRef = useRef(threadId);
-  useEffect(() => {
-    threadIdRef.current = threadId;
-  }, [threadId]);
-
-  // Latest rendered transcript — used to seed a new turn so resuming a thread
-  // keeps its previously-loaded history instead of replacing it.
-  const messagesRef = useRef<UiMessage[]>([]);
-  useEffect(() => {
-    messagesRef.current = messages;
-  }, [messages]);
-
-  // Which thread the in-memory transcript currently belongs to. When the URL
-  // threadId changes to a different value (history sidebar click / shared
-  // link), we replay that thread's transcript. When it matches, we leave the
-  // live transcript untouched — e.g. the `done` event assigning an id to the
-  // fresh conversation currently on screen.
-  const transcriptThread = useRef<string | null>(null);
+  // 线程切换：把目标线程的转写渲染出来。绝不 abort 后台流——事件按
+  // 线程路由（setTranscript），切走再切回来内容都在。effect 不再依赖
+  // 任何跨执行的 ref 记号（旧实现的 transcriptThread 记号正是"切回上
+  // 一个会话视图不动"的根源），StrictMode 双执行也天然安全。
   useEffect(() => {
     const target = threadId ?? null;
-    if (target === transcriptThread.current) return;
-    // 切换线程：进行中的流仍属于旧线程（会覆盖视图、无法停止）——
-    // abort 它，同时触发后端的断连取消。
-    abortRef.current?.abort();
-    // 记住进入前的值：cleanup 时回滚。React StrictMode（开发模式）会
-    // 双执行 effect——如果不回滚，第二次执行会因 ref 已等于 target 而
-    // 早退，第一次启动的 fetch 又被 cleanup 取消，历史恢复整体失效。
-    const previousThread = transcriptThread.current;
-    transcriptThread.current = target;
     setError(null);
-
     if (!target) {
       setMessages([]);
       return;
     }
-
-    // Fast path: replay the locally-persisted transcript (instant).
-    const stored = getThreadMessages(target);
-    if (stored) {
-      setMessages(stored);
+    const live = transcriptsRef.current.get(target);
+    if (live) {
+      setMessages(live);
       return;
     }
+    // 本地持久化的转写（即时显示），随后后台与后端对账（见下）。
+    const stored = getThreadMessages(target);
+    if (stored) setMessages(stored);
 
-    // No local transcript — fetch the persisted history from the backend
-    // checkpointer (threads created before transcript persistence, or on
-    // another device). Fall back to an empty transcript if unavailable.
     const thread = getThread(target);
     const mod = thread?.module || finalModule;
     if (!finalApiUrl || !mod) {
-      setMessages([]);
+      if (!stored) setMessages([]);
       return;
     }
     let cancelled = false;
@@ -206,9 +250,16 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           module: mod,
           threadId: target,
         });
-        if (!cancelled) setMessages(history.messages.map(toUiMessage));
+        if (cancelled) return;
+        const remote = history.messages.map(toUiMessage);
+        // 后端是该线程转写的权威来源，但只在"不少于本地"时覆盖：被停止
+        // 的轮次后端可能只有更短的历史，不能拿旧快照抹掉用户刚看到的
+        // 半截回复。
+        if (remote.length > (stored?.length ?? 0)) {
+          setTranscript(target, remote);
+        }
       } catch (err) {
-        if (!cancelled) {
+        if (!cancelled && !stored) {
           // 拉取失败不能伪装成"空会话"——用户无从区分丢历史和没历史。
           setMessages([]);
           const message = err instanceof Error ? err.message : String(err);
@@ -227,14 +278,13 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     })();
     return () => {
       cancelled = true;
-      transcriptThread.current = previousThread;
     };
-  }, [threadId, getThreadMessages, getThread, finalApiUrl, finalModule]);
+  }, [threadId, getThreadMessages, getThread, finalApiUrl, finalModule, setTranscript]);
 
   const sendMessage = useCallback(
-    async (text: string) => {
-      if (!finalApiUrl || !finalModule) return;
-      if (isLoading || !text.trim()) return;
+    async (text: string): Promise<SendMessageResult> => {
+      if (!finalApiUrl || !finalModule) return { ok: false, draft: text };
+      if (!text.trim()) return { ok: false, draft: text };
 
       const rid = requestId();
       const humanId = `h-${rid}`;
@@ -242,23 +292,41 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       // thread id 前置生成（后端接受客户端提供的 id，并按
       // module:thread_id 划分命名空间）：本地生成而不是等 done 事件，
       // 断网/停止的对话也能落库恢复，不会悄悄丢失。
-      const turnThreadId = threadIdRef.current ?? rid;
-      // Local transcript is the single source of truth while streaming: the
-      // same array is rendered (setMessages) and later persisted, so the saved
-      // history always matches what the user saw. Seed from the messages
-      // currently on screen (loaded history for a resumed thread, or [] for a
-      // brand-new conversation) before appending the new human turn.
+      const currentThreadId = threadIdRef.current;
+      const turnThreadId = currentThreadId ?? rid;
+      // 同一线程同时只允许一轮：并发写同一个 checkpointer 线程会竞态。
+      if (streamingRef.current.has(turnThreadId)) {
+        return { ok: false, draft: text };
+      }
+      streamingRef.current.add(turnThreadId);
+      const turnModule = finalModule;
+
+      // Seed from the thread's own transcript (live in memory, else what is
+      // on screen, else locally persisted) before appending the new turn.
+      const seed =
+        transcriptsRef.current.get(turnThreadId) ??
+        (activeThreadRef.current === turnThreadId ? messagesRef.current : undefined) ??
+        getThreadMessages(turnThreadId) ??
+        [];
       let transcript: UiMessage[] = [
-        ...messagesRef.current,
+        ...seed,
         { id: humanId, role: "human", content: text.trim() },
       ];
-      setMessages(transcript);
-      setIsLoading(true);
+      setTranscript(turnThreadId, transcript);
       setError(null);
-      // The transcript on screen now belongs to this thread id, so the
-      // threadId effect must not treat it as a switch and reload.
-      transcriptThread.current = turnThreadId;
       updateThreadId(turnThreadId);
+      // 立即持久化：流中刷新/崩溃至少保住用户已发出的消息和线程记录，
+      // 而不是整轮凭空蒸发。
+      if (transcript.length > 0) {
+        const existingAtStart = getThread(turnThreadId);
+        saveThread({
+          threadId: turnThreadId,
+          title: existingAtStart?.title ?? text.trim().slice(0, 60),
+          module: turnModule,
+          updatedAt: Date.now(),
+          messages: transcript,
+        });
+      }
 
       let firstDeltaSeen = false;
       // 同名步骤在同一轮里可以出现多次（agent → tools → agent），
@@ -268,12 +336,13 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       let stepSeq = 0;
 
       const controller = new AbortController();
-      abortRef.current = controller;
-
+      abortRefs.current.set(turnThreadId, controller);
+      let aborted = false;
+      let failed = false;
       try {
         const events = invokeAgent({
           apiUrl: finalApiUrl,
-          module: finalModule,
+          module: turnModule,
           message: text.trim(),
           threadId: turnThreadId,
           requestId: rid,
@@ -281,13 +350,14 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         });
         for await (const event of events) {
           transcript = applyEvent(event, transcript);
-          setMessages(transcript);
+          setTranscript(turnThreadId, transcript);
         }
       } catch (err) {
-        const aborted = err instanceof Error && err.name === "AbortError";
+        aborted = err instanceof Error && err.name === "AbortError";
         if (!aborted) {
+          failed = true;
           const message = err instanceof Error ? err.message : String(err);
-          setError(message);
+          if (activeThreadRef.current === turnThreadId) setError(message);
           toast.error("请求 agent-base 失败", {
             description: (
               <p>
@@ -302,24 +372,89 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
             // 断流兜底：一个 token 都没收到时回滚这条 human 消息，
             // 否则界面留下永远没有回复的孤儿消息，重发还会重复。
             transcript = transcript.filter((m) => m.id !== humanId);
-            setMessages(transcript);
+            setTranscript(turnThreadId, transcript);
           }
         }
         // 用户主动停止（aborted）：保留已生成的部分内容，不当作错误。
       } finally {
-        abortRef.current = null;
-        setIsLoading(false);
+        abortRefs.current.delete(turnThreadId);
+        streamingRef.current.delete(turnThreadId);
+        setStreamingTrigger((n) => n + 1); // 触发 isLoading 重算
+        // 收尾：把仍在 "running" 的步骤标记为终态。流结束后不允许任何
+        // running 徽标存活（旧实现正是在这里留下永久"运行中"）。
+        const stopped = aborted;
+        transcript = transcript.map((m) =>
+          m.role === "tool" && m.status === "running"
+            ? {
+                ...m,
+                status: "error" as const,
+                detail: stopped ? "已停止" : "已中断",
+              }
+            : m,
+        );
+        setTranscript(turnThreadId, transcript);
+
         // Persist the thread (with its full transcript) so the history
         // sidebar can reopen it later. A fully rolled-back turn has nothing
-        // worth persisting.
+        // worth persisting. 标题只在会话首轮以首条用户消息命名（与后端
+        // /threads 端点一致），后续轮次不改写。
         if (transcript.length > 0) {
+          const existing = getThread(turnThreadId);
           saveThread({
             threadId: turnThreadId,
-            title: text.trim().slice(0, 60),
-            module: finalModule,
+            title: existing?.title ?? text.trim().slice(0, 60),
+            module: turnModule,
             updatedAt: Date.now(),
             messages: transcript,
           });
+        }
+
+        // 正常完成的轮次：以后端 checkpointer 为权威做一次对账，替换本地
+        // 转写。这从根上治愈"本地视图与真实历史漂移"（停止/中断残留的
+        // 半截内容、丢步骤等）。被用户停止的轮次不对账——后端可能没有
+        // 本轮 checkpoint，对账会把用户刚看到的半截回复抹掉。
+        if (!aborted) {
+          void reconcileFromBackend(turnThreadId, turnModule);
+        }
+      }
+
+      // 失败时调用方会把草稿放回输入框；停止/成功不回填。
+      return { ok: !failed, draft: text };
+
+      async function reconcileFromBackend(
+        id: string,
+        mod: string,
+      ): Promise<void> {
+        try {
+          const history = await fetchThreadHistory({
+            apiUrl: finalApiUrl,
+            module: mod,
+            threadId: id,
+          });
+          const remote = history.messages.map(toUiMessage);
+          // 轮次已结束（同线程串行）。只在后端历史比本地更完整时才覆盖：
+          // 本地转写带步骤徽标、所见即所得，比它短的后端快照没有理由
+          // 抹掉它；比它长说明本地确实缺了内容（唯一要治的漂移）。
+          // 若用户在对账返回前删掉了该线程，transcriptsRef 里没有它则跳过。
+          if (
+            remote.length > transcript.length &&
+            transcriptsRef.current.has(id)
+          ) {
+            setTranscript(id, remote);
+            const current = getThread(id);
+            if (current) {
+              // 重建一条干净的本地记录：不带 remote 标记（转写已在本地）。
+              saveThread({
+                threadId: id,
+                title: current.title,
+                module: current.module,
+                updatedAt: Date.now(),
+                messages: remote,
+              });
+            }
+          }
+        } catch {
+          // 对账失败不打扰用户：本地转写已经是完整所见即所得。
         }
       }
 
@@ -371,7 +506,9 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
             // thread_id 与之一致，这里无需再处理。
             return current;
           case "error":
-            setError(event.message);
+            if (activeThreadRef.current === turnThreadId) {
+              setError(event.message);
+            }
             toast.error("agent-base 返回错误", {
               description: (
                 <p>
@@ -386,38 +523,51 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         }
       }
     },
-    [finalApiUrl, finalModule, isLoading, saveThread, updateThreadId],
+    [
+      finalApiUrl,
+      finalModule,
+      getThreadMessages,
+      getThread,
+      saveThread,
+      setTranscript,
+      updateThreadId,
+    ],
   );
 
   const stop = useCallback(() => {
-    abortRef.current?.abort();
+    const id = activeThreadRef.current;
+    if (id === null) return;
+    abortRefs.current.get(id)?.abort();
   }, []);
 
   const resetThread = useCallback(() => {
-    abortRef.current?.abort();
+    // 后台流不中止：它属于它自己的线程，事件照常落账并持久化；
+    // 用户想停可以点"停止"。这里只是把视图切到一张白纸。
     setMessages([]);
     setError(null);
-    transcriptThread.current = null;
     updateThreadId(null);
   }, [updateThreadId]);
 
   // 模块切换后 thread 命名空间不同：沿用旧 thread_id 会在新模块下命中
   // 另一个（多半为空的）会话，上下文静默错位——因此换模块必须重置线程。
   // 侧栏打开历史线程时也会先 setModule 再 setThreadId，重置不影响恢复。
+  // 后台流照常继续（事件按线程路由，不属于当前视图）。
   const switchModule = useCallback(
     (value: string) => {
       setModule(value);
       writeStorage(MODULE_STORAGE_KEY, value);
       if (value !== module) {
-        abortRef.current?.abort();
         setMessages([]);
         setError(null);
-        transcriptThread.current = null;
         updateThreadId(null);
       }
     },
     [module, setModule, updateThreadId],
   );
+
+  // trigger 变化令本次渲染重算 isLoading（流开始/结束都要刷新按钮态）。
+  void streamingTrigger;
+  const isLoading = threadId !== null && streamingRef.current.has(threadId);
 
   const value: StreamState = {
     messages,

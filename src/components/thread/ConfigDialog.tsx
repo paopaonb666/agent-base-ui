@@ -70,6 +70,14 @@ export function ConfigDialog({
 
   const handleSave = async () => {
     if (!apiUrl.trim() || !module.trim()) return;
+    // 模块名先本地校验（列表拉到过才有）：垃圾模块名保存后只会在
+    // 发消息时以一句干巴巴的 Not Found 暴露。
+    if (modules.length > 0 && !modules.some((m) => m.name === module.trim())) {
+      setTestError(
+        `未知模块 "${module.trim()}"；可用模块：${modules.map((m) => m.name).join("、")}`,
+      );
+      return;
+    }
     setTesting(true);
     setTestError(null);
     try {

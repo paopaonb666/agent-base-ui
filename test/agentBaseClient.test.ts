@@ -4,6 +4,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  deleteThread,
+  extractErrorDetail,
   fetchHealth,
   fetchThreadHistory,
   invokeAgent,
@@ -178,6 +180,36 @@ describe("fetchThreadHistory / fetchHealth / listModules", () => {
     await expect(
       fetchThreadHistory({ apiUrl: "http://b", module: "chat", threadId: "x" }),
     ).rejects.toThrow("nope");
+  });
+
+  it("extractErrorDetail 把 FastAPI 422 的数组 detail 格式化成可读文本", async () => {
+    const response = jsonResponse(
+      {
+        detail: [
+          {
+            msg: "String should have at most 100000 characters",
+            loc: ["body", "message"],
+          },
+          { msg: "extra_forbidden", loc: ["body", "thread_id"] },
+        ],
+      },
+      422,
+    );
+    const detail = await extractErrorDetail(response);
+    expect(detail).toContain("String should have at most 100000 characters");
+    expect(detail).toContain("body.message");
+    expect(detail).toContain("extra_forbidden（body.thread_id）");
+  });
+
+  it("deleteThread 调用 DELETE 端点且成功时不抛错", async () => {
+    const fetchMock = vi.fn(async (_url: unknown) => jsonResponse({ deleted: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(
+      deleteThread({ apiUrl: "http://b", module: "chat", threadId: "t1" }),
+    ).resolves.toBeUndefined();
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://b/v1/agents/chat/threads/t1",
+    );
   });
 
   it("fetchHealth 返回健康状态", async () => {

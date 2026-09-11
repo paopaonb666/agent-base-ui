@@ -10,6 +10,9 @@ export function ChatInterface() {
   const stream = useStreamContext();
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
+  // 发送后立即清空；若这一轮在收到任何回复前失败，把草稿放回来，
+  // 避免用户的长文本凭空丢失（只能改小重发）。
+  const draftRef = useRef("");
 
   const messages = stream.messages;
   const isLoading = stream.isLoading;
@@ -29,8 +32,14 @@ export function ChatInterface() {
     e.preventDefault();
     const text = input.trim();
     if (!text || isLoading) return;
-    void stream.sendMessage(text);
+    draftRef.current = text;
     setInput("");
+    void stream.sendMessage(text).then((result) => {
+      if (!result.ok && !stream.isLoading) {
+        // 发送失败：恢复草稿（若期间用户已输入新内容则不覆盖）。
+        setInput((prev) => (prev ? prev : (result.draft ?? draftRef.current)));
+      }
+    });
   };
 
   return (
