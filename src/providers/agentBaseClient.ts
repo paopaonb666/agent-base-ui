@@ -77,6 +77,38 @@ export interface ThreadHistory {
   messages: ThreadHistoryMessage[];
 }
 
+export interface UploadedFile {
+  file_id: string;
+  filename: string;
+  format: string;
+  pages: number | null;
+  paragraphs: number | null;
+  truncated: boolean;
+  text_len: number;
+  text: string;
+}
+
+/**
+ * 上传并解析文档（M4a 解析层的 HTTP 入口）。后端按扩展名推断格式，
+ * 解析失败以 400 返回可读原因；文本经 DOC_PARSE_MAX_OUTPUT_CHARS 截断。
+ */
+export async function uploadDocument(args: {
+  apiUrl: string;
+  module: string;
+  file: File;
+  signal?: AbortSignal;
+}): Promise<UploadedFile> {
+  const { apiUrl, module, file, signal } = args;
+  const form = new FormData();
+  form.append("file", file);
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(module)}/files`;
+  const response = await fetch(url, { method: "POST", body: form, signal });
+  if (!response.ok) {
+    throw new Error(await extractErrorDetail(response));
+  }
+  return (await response.json()) as UploadedFile;
+}
+
 /**
  * Fetch a thread's persisted message history from the backend checkpointer.
  *
