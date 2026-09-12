@@ -6,10 +6,14 @@ import { MessagesSquare, Settings, SquarePen } from "lucide-react";
 import { ThreadList } from "./ThreadList";
 import { ChatInterface } from "./ChatInterface";
 import { ConfigDialog } from "./ConfigDialog";
+import { ThreadStatusBadge } from "./ThreadStatusBadge";
 import { useStreamContext } from "@/providers/Stream";
+import { useThreads } from "@/providers/Thread";
+import { resolveThreadStatus } from "@/lib/thread-status";
 
 export function AgentChatApp() {
   const stream = useStreamContext();
+  const { threads } = useThreads();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [configOpen, setConfigOpen] = useState(false);
 
@@ -24,12 +28,27 @@ export function AgentChatApp() {
     stream.setThreadId(id);
   };
 
+  // 顶栏展示当前会话的收尾状态（进行中则显示"正在对话"）。threads 来自
+  // Thread context：saveThread 更新索引状态时顶栏随之重渲染。
+  const activeThread = stream.threadId
+    ? threads.find((t) => t.threadId === stream.threadId)
+    : undefined;
+
   return (
     <>
       <div className="flex h-screen flex-col">
         <header className="border-border flex h-16 items-center justify-between border-b px-6">
           <div className="flex items-center gap-4">
             <h1 className="text-xl font-semibold">Agent 基座界面</h1>
+            {stream.threadId && (
+              <ThreadStatusBadge
+                status={resolveThreadStatus(
+                  activeThread,
+                  stream.isThreadStreaming(stream.threadId),
+                )}
+                withLabel
+              />
+            )}
             <Button
               variant="ghost"
               size="sm"

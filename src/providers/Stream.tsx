@@ -8,7 +8,7 @@ import React, {
   useEffect,
 } from "react";
 import { toast } from "sonner";
-import { useThreads, type ThreadMessage } from "./Thread";
+import { useThreads, type ThreadMessage, type ThreadStatus } from "./Thread";
 import {
   AgentBaseEvent,
   fetchThreadHistory,
@@ -41,6 +41,9 @@ export interface StreamState {
   sendMessage: (text: string) => Promise<SendMessageResult>;
   stop: () => void;
   resetThread: () => void;
+  /** 该线程是否正在流式对话（按线程追踪，与活跃视图无关）。渲染期调用，
+   *  流开始/结束时由 streamingTrigger 触发重算（与 isLoading 同款机制）。 */
+  isThreadStreaming: (threadId: string) => boolean;
 }
 
 const StreamContext = createContext<StreamState | undefined>(undefined);
@@ -316,7 +319,8 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       setError(null);
       updateThreadId(turnThreadId);
       // 立即持久化：流中刷新/崩溃至少保住用户已发出的消息和线程记录，
-      // 而不是整轮凭空蒸发。
+      // 而不是整轮凭空蒸发。status 标记"正在对话"：流正常收口会被终态
+      // 覆盖；流中刷新则由 sanitizeStatus 把它降级为"对话终止"。
       if (transcript.length > 0) {
         const existingAtStart = getThread(turnThreadId);
         saveThread({
@@ -325,20 +329,29 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           module: turnModule,
           updatedAt: Date.now(),
           messages: transcript,
+          status: "streaming",
         });
       }
 
       let firstDeltaSeen = false;
-      // 同名步骤在同一轮里可以出现多次（agent → tools → agent），
-      // 按 name 匹配会互相污染：记录 name -> 正在运行的那条消息 id，
-      // 状态只更新匹配的 id，没有对应 running 的 completed 是 no-op。
-      const runningSteps = new Map<string, string>();
+      // 同名步骤在同一轮里可以出现多次（agent → tools → agent），而且
+      // 模型可以在一条消息里并行发多个同名工具调用（如两次 web_search），
+      // 各自的 running/completed 事件按到达顺序交错。按 name 单槽匹配会
+      // 互相覆盖：第二次 running 顶掉第一次的槽位，先完成的 completed
+      // 配到后启动的条目上，先启动的条目永远留在 running——收口时被误标
+      // "已中断"。因此每个 name 维护一个 FIFO 队列：running 入队，
+      // completed 出队，与事件到达顺序天然配对；没有对应 running 的
+      // completed 是 no-op。
+      const runningSteps = new Map<string, string[]>();
       let stepSeq = 0;
 
       const controller = new AbortController();
       abortRefs.current.set(turnThreadId, controller);
       let aborted = false;
       let failed = false;
+      // 后端在流中返回 error 事件：本轮已废，但连接多半还会走到 done，
+      // catch 抓不到——单独记号，收口时归入"对话异常"。
+      let backendErrored = false;
       try {
         const events = invokeAgent({
           apiUrl: finalApiUrl,
@@ -394,6 +407,15 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         );
         setTranscript(turnThreadId, transcript);
 
+        // 会话收尾状态：用户停止 = 终止；请求失败或后端报错 = 异常；
+        // 其余 = 正常结束（chat-agent 把这三类终态混在一个 finally 里
+        // 不区分，这里显式区分开，供侧栏/顶栏的状态点展示）。
+        const finalStatus: ThreadStatus = aborted
+          ? "terminated"
+          : failed || backendErrored
+            ? "error"
+            : "ended";
+
         // Persist the thread (with its full transcript) so the history
         // sidebar can reopen it later. A fully rolled-back turn has nothing
         // worth persisting. 标题只在会话首轮以首条用户消息命名（与后端
@@ -406,7 +428,22 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
             module: turnModule,
             updatedAt: Date.now(),
             messages: transcript,
+            status: finalStatus,
           });
+        } else if (finalStatus === "error") {
+          // 全新线程整轮回滚（一个 token 都没收到）：转写没东西可存，
+          // 但索引里已有开始时落下的 "streaming" 记录，必须收口成异常态，
+          // 否则刷新后会被误降级为"对话终止"。
+          const existing = getThread(turnThreadId);
+          if (existing) {
+            saveThread({
+              threadId: turnThreadId,
+              title: existing.title,
+              module: existing.module,
+              updatedAt: Date.now(),
+              status: "error",
+            });
+          }
         }
 
         // 正常完成的轮次：以后端 checkpointer 为权威做一次对账，替换本地
@@ -444,12 +481,14 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
             const current = getThread(id);
             if (current) {
               // 重建一条干净的本地记录：不带 remote 标记（转写已在本地）。
+              // status 保留收尾时写入的终态——对账只修内容，不改状态。
               saveThread({
                 threadId: id,
                 title: current.title,
                 module: current.module,
                 updatedAt: Date.now(),
                 messages: remote,
+                status: current.status ?? "ended",
               });
             }
           }
@@ -468,7 +507,9 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           case "step": {
             if (event.status === "running") {
               const stepId = `t-${rid}-${stepSeq++}`;
-              runningSteps.set(event.name, stepId);
+              const queue = runningSteps.get(event.name) ?? [];
+              queue.push(stepId);
+              runningSteps.set(event.name, queue);
               return [
                 ...current,
                 {
@@ -480,13 +521,38 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
                 },
               ];
             }
-            // completed / error 只落到该名字当前正在运行的那条上。
-            const runningId = runningSteps.get(event.name);
-            if (!runningId) return current;
-            runningSteps.delete(event.name);
+            // completed / error 只落到该名字 FIFO 队列的队首：并行同名
+            // 调用时按事件到达顺序配对；completed 事件若携带自己的
+            // detail（如"找到 N 条结果"），在 running 详情之外补上。
+            const queue = runningSteps.get(event.name);
+            if (!queue || queue.length === 0) return current;
+            const runningId = queue.shift()!;
+            if (queue.length === 0) runningSteps.delete(event.name);
             return current.map((m) =>
-              m.id === runningId ? { ...m, status: event.status } : m,
+              m.id === runningId
+                ? {
+                    ...m,
+                    status: event.status,
+                    ...(event.status === "completed" && event.detail
+                      ? { result: event.detail }
+                      : {}),
+                  }
+                : m,
             );
+          }
+          case "sources": {
+            // 工具发布的引用来源：作为独立转写条目渲染在回复旁。
+            if (!event.sources || event.sources.length === 0) return current;
+            return [
+              ...current,
+              {
+                id: `s-${rid}-${stepSeq++}`,
+                role: "sources" as const,
+                sources: event.sources
+                  .filter((s) => s.title)
+                  .map((s) => ({ title: s.title, ...(s.url ? { url: s.url } : {}) })),
+              },
+            ];
           }
           case "delta":
             if (!firstDeltaSeen) {
@@ -506,6 +572,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
             // thread_id 与之一致，这里无需再处理。
             return current;
           case "error":
+            backendErrored = true;
             if (activeThreadRef.current === turnThreadId) {
               setError(event.message);
             }
@@ -569,6 +636,11 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   void streamingTrigger;
   const isLoading = threadId !== null && streamingRef.current.has(threadId);
 
+  const isThreadStreaming = useCallback(
+    (id: string) => streamingRef.current.has(id),
+    [],
+  );
+
   const value: StreamState = {
     messages,
     isLoading,
@@ -582,6 +654,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     sendMessage,
     stop,
     resetThread,
+    isThreadStreaming,
   };
 
   return (

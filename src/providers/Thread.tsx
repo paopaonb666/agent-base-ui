@@ -28,6 +28,12 @@ const MAX_THREADS = 50;
 // endpoint (thin base), so the UI persists the transcript it already renders
 // and replays it when a past thread is reopened. The backend checkpointer
 // independently restores *context* for follow-up turns.
+// 引用来源（web_search 等工具经 sources 事件发布；附着在回复旁渲染）。
+export interface SourceRef {
+  title: string;
+  url?: string;
+}
+
 export type ThreadMessage =
   | { id: string; role: "human"; content: string }
   | { id: string; role: "assistant"; content: string }
@@ -37,7 +43,16 @@ export type ThreadMessage =
       name: string;
       status: "running" | "completed" | "error";
       detail?: string;
-    };
+      result?: string;
+    }
+  | { id: string; role: "sources"; sources: SourceRef[] };
+
+// 会话级状态（参考 chat-agent 的步骤/工具状态色板，提升到会话维度）：
+//   streaming  — 正在对话（流进行中的运行时状态）
+//   ended      — 对话结束（正常完成）
+//   terminated — 对话终止（用户停止、页面刷新/关闭打断）
+//   error      — 对话异常（请求失败、后端返回错误事件）
+export type ThreadStatus = "streaming" | "ended" | "terminated" | "error";
 
 export interface RecentThread {
   threadId: string;
@@ -47,6 +62,12 @@ export interface RecentThread {
   messages?: ThreadMessage[];
   /** 来自后端 checkpointer 的线程（本地无 transcript，点击走历史恢复）。 */
   remote?: boolean;
+  /**
+   * 最近一轮对话的收尾状态。streaming 只存在于流进行中的内存态——从存储
+   * 读到 streaming 一律降级为 terminated（没有流能活过一次页面刷新）。
+   * 缺省（旧记录、纯云端线程）视为 ended。
+   */
+  status?: ThreadStatus;
 }
 
 interface ThreadContextType {
@@ -69,6 +90,14 @@ const ThreadContext = createContext<ThreadContextType | undefined>(undefined);
 // message whose content is an object (rendered as "[object Object]") or a
 // tool step stuck at "running" (no stream survives a page reload). Anything
 // read back from storage goes through here.
+
+// 只接受合法枚举；残留的 "streaming" 说明上次会话在流进行中被刷新/关闭
+// 打断（与 sanitizeMessages 把残留 running 步骤改成 error 是同一个道理）。
+function sanitizeStatus(raw: unknown): ThreadStatus | undefined {
+  if (raw === "ended" || raw === "terminated" || raw === "error") return raw;
+  if (raw === "streaming") return "terminated";
+  return undefined;
+}
 
 function sanitizeMessages(messages: unknown): ThreadMessage[] {
   if (!Array.isArray(messages)) return [];
@@ -98,7 +127,27 @@ function sanitizeMessages(messages: unknown): ThreadMessage[] {
           : status === "error" && m.status === "running"
             ? { detail: "已中断（页面刷新或关闭）" }
             : {}),
+        ...(typeof m.result === "string" && m.result ? { result: m.result } : {}),
       });
+    } else if (role === "sources") {
+      // sources 事件：只保留带非空 title 的引用，上限 20 条防存储膨胀。
+      const rawSources = Array.isArray(m.sources) ? m.sources : [];
+      const sources = rawSources
+        .filter(
+          (s: unknown): s is Record<string, unknown> =>
+            typeof s === "object" &&
+            s !== null &&
+            typeof (s as Record<string, unknown>).title === "string" &&
+            ((s as Record<string, unknown>).title as string).trim().length > 0,
+        )
+        .slice(0, 20)
+        .map((s: Record<string, unknown>) => ({
+          title: String(s.title),
+          ...(typeof s.url === "string" && s.url ? { url: s.url } : {}),
+        }));
+      if (sources.length > 0) {
+        out.push({ id, role: "sources", sources });
+      }
     }
   }
   return out;
@@ -108,6 +157,7 @@ function sanitizeThread(raw: unknown): RecentThread | null {
   if (typeof raw !== "object" || raw === null) return null;
   const t = raw as Record<string, unknown>;
   if (typeof t.threadId !== "string" || !t.threadId) return null;
+  const status = sanitizeStatus(t.status);
   return {
     threadId: t.threadId,
     title: typeof t.title === "string" ? t.title : t.threadId,
@@ -117,6 +167,7 @@ function sanitizeThread(raw: unknown): RecentThread | null {
       ? { messages: sanitizeMessages(t.messages) }
       : {}),
     ...(t.remote === true ? { remote: true } : {}),
+    ...(status ? { status } : {}),
   };
 }
 

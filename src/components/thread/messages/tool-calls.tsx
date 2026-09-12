@@ -13,10 +13,12 @@ export function ToolStep({
   name,
   status,
   detail,
+  result,
 }: {
   name: string;
   status: ToolStepStatus;
   detail?: string;
+  result?: string;
 }) {
   const Icon =
     status === "running" ? LoaderCircle : status === "completed" ? Check : X;
@@ -51,6 +53,14 @@ export function ToolStep({
             title={detail}
           >
             {detail}
+          </p>
+        ) : null}
+        {result ? (
+          <p
+            className="mt-0.5 truncate text-xs text-gray-400"
+            title={result}
+          >
+            {result}
           </p>
         ) : null}
       </div>

@@ -1,6 +1,7 @@
 "use client";
 
 import { memo } from "react";
+import { ExternalLink } from "lucide-react";
 import { UiMessage } from "@/providers/Stream";
 import { MarkdownText } from "./markdown-text";
 import { ToolStep } from "./messages/tool-calls";
@@ -18,7 +19,42 @@ export const ChatMessage = memo(function ChatMessage({
         name={message.name}
         status={message.status}
         detail={message.detail}
+        result={message.result}
       />
+    );
+  }
+
+  if (message.role === "sources") {
+    // 工具发布的引用来源（web_search）：可点击的外链卡片。
+    return (
+      <div className="mx-auto grid w-full max-w-3xl gap-1">
+        <div className="rounded-lg border border-gray-200 bg-gray-50/60 px-4 py-2">
+          <p className="m-0 text-xs font-medium text-gray-500">信息来源</p>
+          <ul className="m-0 mt-1 flex list-none flex-col gap-1 p-0">
+            {message.sources.map((s, i) => (
+              <li key={`${s.title}-${i}`} className="truncate text-xs">
+                <span className="mr-1 text-gray-400">[{i + 1}]</span>
+                {s.url ? (
+                  <a
+                    href={s.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-blue-600 hover:underline"
+                    title={s.title}
+                  >
+                    <span className="truncate">{s.title}</span>
+                    <ExternalLink className="size-3 shrink-0" />
+                  </a>
+                ) : (
+                  <span className="text-gray-600" title={s.title}>
+                    {s.title}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
     );
   }
 

@@ -12,6 +12,11 @@
 
 export type AgentBaseStepStatus = "running" | "completed" | "error";
 
+export interface AgentBaseSource {
+  title: string;
+  url?: string | null;
+}
+
 export type AgentBaseEvent =
   | { type: "ping" }
   | {
@@ -20,6 +25,7 @@ export type AgentBaseEvent =
       status: AgentBaseStepStatus;
       detail?: string | null;
     }
+  | { type: "sources"; sources: AgentBaseSource[] }
   | { type: "delta"; content: string }
   | { type: "done"; thread_id?: string | null }
   | { type: "error"; message: string };
@@ -208,6 +214,21 @@ export function parseFrame(frame: string): AgentBaseEvent | null {
         status: (data.status as AgentBaseStepStatus) ?? "running",
         detail: typeof data.detail === "string" ? data.detail : null,
       };
+    case "sources": {
+      // 工具发布的引用来源（如 web_search）：字段已由后端按契约模型
+      // 校验过，这里只做防御性收窄。
+      const raw = Array.isArray(data.sources) ? data.sources : [];
+      const sources: AgentBaseSource[] = raw
+        .filter(
+          (s: unknown): s is Record<string, unknown> =>
+            typeof s === "object" && s !== null && typeof (s as Record<string, unknown>).title === "string",
+        )
+        .map((s: Record<string, unknown>) => ({
+          title: String(s.title),
+          url: typeof s.url === "string" ? s.url : null,
+        }));
+      return { type: "sources", sources };
+    }
     case "delta":
       return { type: "delta", content: String(data.content ?? "") };
     case "done":

@@ -9,6 +9,8 @@ import { cn } from "@/lib/utils";
 import { useThreads, type RecentThread } from "@/providers/Thread";
 import { deleteThread, listThreads } from "@/providers/agentBaseClient";
 import { useStreamContext } from "@/providers/Stream";
+import { resolveThreadStatus } from "@/lib/thread-status";
+import { ThreadStatusBadge } from "./ThreadStatusBadge";
 import { toast } from "sonner";
 
 const GROUP_LABELS = {
@@ -221,6 +223,13 @@ export function ThreadList({
                               <span className="text-muted-foreground flex-1 truncate text-xs">
                                 {thread.module}
                               </span>
+                              <ThreadStatusBadge
+                                status={resolveThreadStatus(
+                                  thread,
+                                  stream.isThreadStreaming(thread.threadId),
+                                )}
+                                withLabel
+                              />
                             </div>
                           </div>
                         </button>
