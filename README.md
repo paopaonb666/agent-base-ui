@@ -9,10 +9,13 @@ agent-base 的配套 Web 聊天界面（Next.js 16 + React 19 + TypeScript）。
 
 ## 功能
 
-- 与任意 agent-base 模块对话（chat / writer / supervisor …）
-- SSE 流式输出（delta 逐字渲染）+ 工具调用步骤展示（step 事件）
-- 会话历史（localStorage 本地索引 + 完整对话文本，点击即可切换并回放历史消息；续聊凭 thread_id 由后端 checkpointer 恢复上下文）
-- 会话持久化：打开首页自动恢复上次会话；对话内容存于后端 checkpointer，本地只留无敏感信息的线程索引
+- 与任意 agent-base 模块对话（chat / writer / supervisor …），免配置直连：默认 `http://localhost:8000` + `chat`，打开首页即见对话框
+- **流式输出**：SSE delta 逐字渲染，前端做打字机平滑揭示（慢速流逐字跟显，高速突发按恒定时滞补放，不会整段一次性砸出）；聊天区内容增长自动贴底滚动，用户上翻即暂停跟随、滚回底部恢复
+- **会话状态徽章**：正在对话 / 对话结束 / 对话终止 / 对话异常 四态彩色状态点，显示在顶栏（当前会话）与侧栏每个会话项上；用户停止与页面刷新中断自动标记为「终止」，请求失败 / 后端报错标记为「异常」
+- **工具调用步骤卡**：运行中 / 已完成 / 已停止 等步骤徽标（并行同名步骤精确配对），工具发布的引用来源经 `sources` 事件渲染为可点击的来源卡片
+- **会话历史**：localStorage 本地索引 + 完整对话文本，侧栏按时间分组，合并显示后端 checkpointer 已持久化的线程（本机没有的也能看到、可删除，删除同步云端）；点击回放历史消息，续聊凭 thread_id 由后端恢复上下文；打开首页自动恢复上次会话
+- **可靠收尾**：流按线程路由（切走再切回、后台流照常落账）；发送即持久化（流中刷新至少保住已发消息）；「停止生成」断连即取消后端 LLM；断流兜底（45s 无事件判定断开）；正常结束后与 checkpointer 对账，防止本地视图与真实历史漂移
+- 设置面板（服务地址 / 模块下拉拉取已注册模块、保存前健康探活）；配置与会话标识不经过 URL，只存本机 localStorage 或构建时环境变量
 
 ## 环境要求
 
@@ -55,16 +58,21 @@ pnpm install       # 安装依赖（lockfile 更新时需 --no-frozen-lockfile�
 pnpm dev           # 开发模式，http://localhost:3000
 pnpm build         # 生产构建（TS 编译检查）
 pnpm start         # 生产预览（需先 build）
+pnpm lint          # ESLint 检查
+pnpm test          # vitest 单元测试
 ```
 
 ## 与 agent-base 的衔接约定
 
-| agent-base-ui                               | agent-base                                        |
-| ------------------------------------------- | ------------------------------------------------- |
-| 请求 `POST /v1/agents/{module}/invoke`      | 见 agent-base 的 `entrypoints/server.py` SSE 服务 |
-| 消费事件 ping / step / delta / done / error | 事件契约见 agent-base 的 `extensions/events.py`   |
-| `threadId`（`done` 事件返回）继续对话       | 后端 checkpointer 恢复上下文                      |
-| 请求 `GET /v1/agents/{module}/threads/{id}` | 读取 checkpointer 里的历史消息，用于回放历史会话  |
+| agent-base-ui                                         | agent-base                                        |
+| ----------------------------------------------------- | ------------------------------------------------- |
+| 请求 `POST /v1/agents/{module}/invoke`                | 见 agent-base 的 `entrypoints/server.py` SSE 服务 |
+| 消费事件 ping / step / delta / sources / done / error | 事件契约见 agent-base 的 `extensions/events.py`   |
+| `threadId`（`done` 事件返回）继续对话                 | 后端 checkpointer 恢复上下文                      |
+| 请求 `GET /v1/agents/{module}/threads/{id}`           | 读取 checkpointer 里的历史消息，用于回放历史会话  |
+| 请求 `GET /v1/agents/{module}/threads`                | 列出该模块已持久化线程（侧栏「云端会话」来源）    |
+| 请求 `DELETE /v1/agents/{module}/threads/{id}`        | 删除会话（本地与后端 checkpointer 同步删除）      |
+| 请求 `GET /health`                                    | 设置面板保存前的服务健康探活                      |
 
 ## 项目结构（本仓库）
 
@@ -72,18 +80,23 @@ pnpm start         # 生产预览（需先 build）
 agent-base-ui/
 ├── src/
 │   ├── providers/
-│   │   ├── agentBaseClient.ts  # SSE 客户端：fetch + 事件解析 + 历史拉取
-│   │   ├── Stream.tsx          # 流式会话状态机（sendMessage / threadId / 配置 / 错误）
-│   │   └── Thread.tsx          # localStorage 会话历史
-│   ├── components/thread/      # 聊天界面（参考 general-agent 的 Deep Agents UI）
-│   │   ├── AgentChatApp.tsx    # 顶栏 + 侧栏 + 聊天区布局
-│   │   ├── ThreadList.tsx      # 对话列表（按时间分组 / 删除）
-│   │   ├── ChatInterface.tsx   # 消息流 + 底部输入框
-│   │   ├── ChatMessage.tsx     # 用户气泡 / AI Markdown / 工具步骤
-│   │   ├── ConfigDialog.tsx    # 设置弹窗（服务地址 / 模块）
+│   │   ├── agentBaseClient.ts  # SSE 客户端：fetch + 事件解析 + 历史/线程/删除接口
+│   │   ├── Stream.tsx          # 流式会话状态机（按线程路由 / 停止 / 对账 / 状态收口）
+│   │   └── Thread.tsx          # localStorage 会话历史（索引 + 收尾状态）
+│   ├── lib/thread-status.ts    # 会话状态判定（流式优先，落库终态兜底）
+│   ├── components/thread/      # 聊天界面
+│   │   ├── AgentChatApp.tsx    # 顶栏（含当前会话状态徽章）+ 侧栏 + 聊天区布局
+│   │   ├── ThreadList.tsx      # 对话列表（本地 + 云端合并 / 时间分组 / 删除）
+│   │   ├── ThreadStatusBadge.tsx # 会话状态点（正在对话/结束/终止/异常）
+│   │   ├── ChatInterface.tsx   # 消息流 + 贴底滚动跟随 + 底部输入框
+│   │   ├── ChatMessage.tsx     # 用户气泡 / AI Markdown（平滑揭示）/ 工具步骤 / 来源卡片
+│   │   ├── use-smooth-text.ts  # 流式输出打字机平滑揭示（display-only）
+│   │   ├── messages/tool-calls.tsx # 工具步骤卡（运行中/已完成/已停止）
+│   │   ├── ConfigDialog.tsx    # 设置弹窗（服务地址 / 模块 / 探活）
 │   │   └── markdown-text.tsx   # Markdown 渲染（代码高亮 / KaTeX）
 │   ├── components/ui/          # UI 原语（button / dialog / input …）
 │   └── app/                    # Next.js 布局与页面
+├── test/                       # vitest 单元测试（SSE 协议解析）
 ├── .env.example                # 配置模板
 └── package.json                # 依赖与脚本（上游 langchain 依赖已移除）
 ```
@@ -91,6 +104,7 @@ agent-base-ui/
 ## 说明与已知边界
 
 - 本前端不做多模态/文件上传、artifact 面板、分支切换——agent-base 契约仅文本流 + 步骤事件
+- 会话状态由前端派生并保存在本地索引（后端不提供会话状态端点）：流进行中优先显示「正在对话」，否则取最近一轮的落库收尾状态；纯云端线程与旧记录缺省显示「对话结束」
 - 切换历史会话时先回放本地保存的对话文本；本地无记录时通过 `GET /v1/agents/{module}/threads/{id}` 从后端 checkpointer 拉取历史，续聊仍由后端恢复上下文
-- ESLint 的 `pnpm lint` 脚本为上游 POSIX 写法，Windows 下请用 `npx eslint src`（开发者环境默认）
+- 模型在调用工具期间没有文本 delta（界面以步骤卡反馈进度），属正常现象
 - 许可证：MIT（沿用上游 agent-chat-ui）
