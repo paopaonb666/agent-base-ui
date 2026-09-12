@@ -44,6 +44,11 @@ export type ThreadMessage =
       status: "running" | "completed" | "error";
       detail?: string;
       result?: string;
+      /** 工具调用记录（M5）：与流式 tool_call 事件/后端历史配对的字段。 */
+      call_id?: string;
+      args?: Record<string, unknown>;
+      duration_ms?: number;
+      error?: string;
     }
   | { id: string; role: "sources"; sources: SourceRef[] };
 
@@ -116,6 +121,7 @@ function sanitizeMessages(messages: unknown): ThreadMessage[] {
     } else if (role === "tool") {
       const status =
         m.status === "completed" || m.status === "error" ? m.status : "error";
+      const rawArgs: unknown = m.args;
       out.push({
         id,
         role: "tool",
@@ -128,6 +134,12 @@ function sanitizeMessages(messages: unknown): ThreadMessage[] {
             ? { detail: "已中断（页面刷新或关闭）" }
             : {}),
         ...(typeof m.result === "string" && m.result ? { result: m.result } : {}),
+        ...(typeof m.call_id === "string" && m.call_id ? { call_id: m.call_id } : {}),
+        ...(typeof rawArgs === "object" && rawArgs !== null
+          ? { args: rawArgs as Record<string, unknown> }
+          : {}),
+        ...(typeof m.duration_ms === "number" ? { duration_ms: m.duration_ms } : {}),
+        ...(typeof m.error === "string" && m.error ? { error: m.error } : {}),
       });
     } else if (role === "sources") {
       // sources 事件：只保留带非空 title 的引用，上限 20 条防存储膨胀。

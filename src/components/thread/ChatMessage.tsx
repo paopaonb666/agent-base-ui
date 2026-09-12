@@ -48,6 +48,9 @@ export const ChatMessage = memo(function ChatMessage({
         status={message.status}
         detail={message.detail}
         result={message.result}
+        args={message.args}
+        duration_ms={message.duration_ms}
+        error={message.error}
       />
     );
   }

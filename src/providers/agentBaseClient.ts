@@ -17,6 +17,9 @@ export interface AgentBaseSource {
   url?: string | null;
 }
 
+export type AgentBaseToolCallPhase = "start" | "end";
+export type AgentBaseToolCallStatus = "ok" | "timeout" | "error";
+
 export type AgentBaseEvent =
   | { type: "ping" }
   | {
@@ -24,6 +27,17 @@ export type AgentBaseEvent =
       name: string;
       status: AgentBaseStepStatus;
       detail?: string | null;
+    }
+  | {
+      type: "tool_call";
+      call_id: string;
+      name: string;
+      phase: AgentBaseToolCallPhase;
+      args?: Record<string, unknown> | null;
+      result?: string | null;
+      status?: AgentBaseToolCallStatus | null;
+      duration_ms?: number | null;
+      error?: string | null;
     }
   | { type: "sources"; sources: AgentBaseSource[] }
   | { type: "delta"; content: string }
@@ -39,11 +53,22 @@ export interface InvokeAgentArgs {
   signal?: AbortSignal;
 }
 
+export interface ThreadHistoryToolCall {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+}
+
 /** One message in a thread's persisted history, as served by the backend. */
 export interface ThreadHistoryMessage {
   role: "human" | "assistant" | "tool";
   content?: string;
   name?: string;
+  /** 仅 assistant：本条消息发起的工具调用（调用参数在此）。 */
+  tool_calls?: ThreadHistoryToolCall[];
+  /** 仅 tool：与发起方 AI 消息的 tool_calls[id] 配对。 */
+  tool_call_id?: string;
+  status?: "ok" | "error";
 }
 
 export interface ThreadHistory {
@@ -228,6 +253,28 @@ export function parseFrame(frame: string): AgentBaseEvent | null {
           url: typeof s.url === "string" ? s.url : null,
         }));
       return { type: "sources", sources };
+    }
+    case "tool_call": {
+      // 工具调用记录（M5）：start 带 args，end 带 result/status/duration。
+      const rawArgs: unknown = data.args;
+      const args: Record<string, unknown> =
+        typeof rawArgs === "object" && rawArgs !== null ? (rawArgs as Record<string, unknown>) : {};
+      const phase = data.phase === "end" ? "end" : "start";
+      const status =
+        data.status === "ok" || data.status === "timeout" || data.status === "error"
+          ? data.status
+          : null;
+      return {
+        type: "tool_call",
+        call_id: String(data.call_id ?? ""),
+        name: String(data.name ?? ""),
+        phase,
+        args,
+        result: typeof data.result === "string" ? data.result : null,
+        status,
+        duration_ms: typeof data.duration_ms === "number" ? data.duration_ms : null,
+        error: typeof data.error === "string" ? data.error : null,
+      };
     }
     case "delta":
       return { type: "delta", content: String(data.content ?? "") };

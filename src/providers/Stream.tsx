@@ -52,30 +52,54 @@ const StreamContext = createContext<StreamState | undefined>(undefined);
 const DEFAULT_API_URL = "http://localhost:8000";
 const DEFAULT_MODULE = "chat"; // chat | writer | supervisor
 
-// Convert a backend history message into the UI message shape. Tool messages
-// from persisted state are always "completed" (a checkpoint only contains
-// finished tool calls).
-function toUiMessage(message: ThreadHistoryMessage, index: number): UiMessage {
-  if (message.role === "human") {
-    return {
-      id: `h-history-${index}`,
-      role: "human",
-      content: message.content ?? "",
-    };
-  }
-  if (message.role === "assistant") {
-    return {
-      id: `a-history-${index}`,
-      role: "assistant",
-      content: message.content ?? "",
-    };
-  }
-  return {
-    id: `t-history-${index}`,
-    role: "tool",
-    name: message.name ?? "",
-    status: "completed",
-  };
+// 把后端历史按序重建为 UI 转写（M5 工具调用可观测）：AI 消息的
+// tool_calls 生成带参数的调用条目，随后的 tool 消息按 tool_call_id
+// 把结果/状态配对回去——参数与结果在 checkpointer 里各自持久化，靠
+// id 合体。配不上的 tool 消息（异常兜底）降级为纯结果 chip。
+function replayToUiMessages(messages: ThreadHistoryMessage[]): UiMessage[] {
+  const out: UiMessage[] = [];
+  const byCallId = new Map<string, number>();
+  messages.forEach((message, index) => {
+    if (message.role === "human") {
+      out.push({ id: `h-history-${index}`, role: "human", content: message.content ?? "" });
+      return;
+    }
+    if (message.role === "assistant") {
+      for (const tc of message.tool_calls ?? []) {
+        if (!tc.id) continue;
+        byCallId.set(tc.id, out.length);
+        out.push({
+          id: `t-history-${tc.id}`,
+          role: "tool",
+          name: tc.name,
+          status: "running", // 若后面的 tool 消息缺失，收尾净化会转成"已中断"
+          ...(tc.args ? { args: tc.args } : {}),
+        });
+      }
+      out.push({ id: `a-history-${index}`, role: "assistant", content: message.content ?? "" });
+      return;
+    }
+    // tool 消息：按 tool_call_id 配对补上结果与状态。
+    const callId = message.tool_call_id ?? "";
+    const at = byCallId.get(callId);
+    if (at !== undefined && out[at]?.role === "tool") {
+      const entry = out[at] as Extract<UiMessage, { role: "tool" }>;
+      out[at] = {
+        ...entry,
+        status: message.status === "error" ? "error" : "completed",
+        result: message.content ?? "",
+      };
+      return;
+    }
+    out.push({
+      id: `t-history-${index}`,
+      role: "tool",
+      name: message.name ?? "",
+      status: message.status === "error" ? "error" : "completed",
+      result: message.content ?? "",
+    });
+  });
+  return out;
 }
 
 // localStorage keys：配置与"最后活跃会话"都不进 URL——后端地址和
@@ -254,7 +278,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           threadId: target,
         });
         if (cancelled) return;
-        const remote = history.messages.map(toUiMessage);
+        const remote = replayToUiMessages(history.messages);
         // 后端是该线程转写的权威来源，但只在"不少于本地"时覆盖：被停止
         // 的轮次后端可能只有更短的历史，不能拿旧快照抹掉用户刚看到的
         // 半截回复。
@@ -343,6 +367,10 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       // completed 出队，与事件到达顺序天然配对；没有对应 running 的
       // completed 是 no-op。
       const runningSteps = new Map<string, string[]>();
+      // 工具调用卡片（M5）：call_id -> 转写条目 id。tool_call 事件的
+      // start/end 靠它精确配对，天然免疫并行同名调用。
+      const toolCardsByCallId = new Map<string, string>();
+      const toolCardIds = new Set<string>();
       let stepSeq = 0;
 
       const controller = new AbortController();
@@ -468,7 +496,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
             module: mod,
             threadId: id,
           });
-          const remote = history.messages.map(toUiMessage);
+          const remote = replayToUiMessages(history.messages);
           // 轮次已结束（同线程串行）。只在后端历史比本地更完整时才覆盖：
           // 本地转写带步骤徽标、所见即所得，比它短的后端快照没有理由
           // 抹掉它；比它长说明本地确实缺了内容（唯一要治的漂移）。
@@ -505,7 +533,11 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           case "ping":
             return current; // heartbeat — nothing to render
           case "step": {
+            // running：该名字已有工具调用卡片在跑时跳过——卡片带参数与
+            // 结果（step 的信息超集），不生成重复 chip。
             if (event.status === "running") {
+              const running = runningSteps.get(event.name);
+              if (running && running.length > 0) return current;
               const stepId = `t-${rid}-${stepSeq++}`;
               const queue = runningSteps.get(event.name) ?? [];
               queue.push(stepId);
@@ -522,8 +554,9 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
               ];
             }
             // completed / error 只落到该名字 FIFO 队列的队首：并行同名
-            // 调用时按事件到达顺序配对；completed 事件若携带自己的
-            // detail（如"找到 N 条结果"），在 running 详情之外补上。
+            // 调用时按事件到达顺序配对；队列里若是工具调用卡片，其终态
+            // 已由 tool_call end 事件写入（end 会把自己摘出队列），此处
+            // 幂等；若 end 因异常路径缺失，此处兜底收尾。
             const queue = runningSteps.get(event.name);
             if (!queue || queue.length === 0) return current;
             const runningId = queue.shift()!;
@@ -536,6 +569,51 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
                     ...(event.status === "completed" && event.detail
                       ? { result: event.detail }
                       : {}),
+                  }
+                : m,
+            );
+          }
+          case "tool_call": {
+            if (event.phase === "start") {
+              const entryId = `tc-${rid}-${event.call_id}`;
+              toolCardsByCallId.set(event.call_id, entryId);
+              toolCardIds.add(entryId);
+              const queue = runningSteps.get(event.name) ?? [];
+              queue.push(entryId);
+              runningSteps.set(event.name, queue);
+              return [
+                ...current,
+                {
+                  id: entryId,
+                  role: "tool",
+                  name: event.name,
+                  status: "running" as const,
+                  call_id: event.call_id,
+                  ...(event.args ? { args: event.args } : {}),
+                },
+              ];
+            }
+            // end：按 call_id 精确回填终态（status/result/耗时/错误），
+            // 并把该条目从 step 的 FIFO 队列摘除。
+            const entryId = toolCardsByCallId.get(event.call_id);
+            if (!entryId) return current;
+            toolCardsByCallId.delete(event.call_id);
+            toolCardIds.delete(entryId);
+            const queue = runningSteps.get(event.name);
+            if (queue) {
+              const at = queue.indexOf(entryId);
+              if (at >= 0) queue.splice(at, 1);
+              if (queue.length === 0) runningSteps.delete(event.name);
+            }
+            const status = event.status === "ok" ? "completed" : "error";
+            return current.map((m) =>
+              m.id === entryId
+                ? {
+                    ...m,
+                    status: status as "completed" | "error",
+                    ...(event.result ? { result: event.result } : {}),
+                    ...(event.duration_ms !== null ? { duration_ms: event.duration_ms } : {}),
+                    ...(event.error ? { error: event.error } : {}),
                   }
                 : m,
             );
