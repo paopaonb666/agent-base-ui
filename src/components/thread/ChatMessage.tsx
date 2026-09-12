@@ -5,6 +5,34 @@ import { ExternalLink } from "lucide-react";
 import { UiMessage } from "@/providers/Stream";
 import { MarkdownText } from "./markdown-text";
 import { ToolStep } from "./messages/tool-calls";
+import { useSmoothText } from "./use-smooth-text";
+
+// 助手消息：流式内容经打字机平滑揭示（display-only，权威转写不变，
+// 见 use-smooth-text）。历史回放/切回的完整消息不做打字重放。
+function AssistantMessage({
+  content,
+  isStreaming,
+}: {
+  content: string;
+  isStreaming?: boolean;
+}) {
+  const shown = useSmoothText(content);
+  return (
+    <div className="flex w-full justify-start">
+      <div className="max-w-full min-w-0">
+        {shown ? (
+          <MarkdownText>{shown}</MarkdownText>
+        ) : isStreaming ? (
+          <div className="flex items-center gap-1 py-2">
+            <span className="bg-foreground/50 size-1.5 animate-pulse rounded-full" />
+            <span className="bg-foreground/50 size-1.5 animate-pulse rounded-full [animation-delay:150ms]" />
+            <span className="bg-foreground/50 size-1.5 animate-pulse rounded-full [animation-delay:300ms]" />
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
 
 export const ChatMessage = memo(function ChatMessage({
   message,
@@ -32,7 +60,10 @@ export const ChatMessage = memo(function ChatMessage({
           <p className="m-0 text-xs font-medium text-gray-500">信息来源</p>
           <ul className="m-0 mt-1 flex list-none flex-col gap-1 p-0">
             {message.sources.map((s, i) => (
-              <li key={`${s.title}-${i}`} className="truncate text-xs">
+              <li
+                key={`${s.title}-${i}`}
+                className="truncate text-xs"
+              >
                 <span className="mr-1 text-gray-400">[{i + 1}]</span>
                 {s.url ? (
                   <a
@@ -46,7 +77,10 @@ export const ChatMessage = memo(function ChatMessage({
                     <ExternalLink className="size-3 shrink-0" />
                   </a>
                 ) : (
-                  <span className="text-gray-600" title={s.title}>
+                  <span
+                    className="text-gray-600"
+                    title={s.title}
+                  >
                     {s.title}
                   </span>
                 )}
@@ -74,18 +108,9 @@ export const ChatMessage = memo(function ChatMessage({
   }
 
   return (
-    <div className="flex w-full justify-start">
-      <div className="max-w-full min-w-0">
-        {message.content ? (
-          <MarkdownText>{message.content}</MarkdownText>
-        ) : isStreaming ? (
-          <div className="flex items-center gap-1 py-2">
-            <span className="bg-foreground/50 size-1.5 animate-pulse rounded-full" />
-            <span className="bg-foreground/50 size-1.5 animate-pulse rounded-full [animation-delay:150ms]" />
-            <span className="bg-foreground/50 size-1.5 animate-pulse rounded-full [animation-delay:300ms]" />
-          </div>
-        ) : null}
-      </div>
-    </div>
+    <AssistantMessage
+      content={message.content}
+      isStreaming={isStreaming}
+    />
   );
 });

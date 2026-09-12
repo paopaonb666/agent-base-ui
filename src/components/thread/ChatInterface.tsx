@@ -18,15 +18,29 @@ export function ChatInterface() {
   const isLoading = stream.isLoading;
   const chatStarted = messages.length > 0;
 
+  // 贴底跟随：流式内容增长时视图跟着滚，用户向上翻阅即暂停跟随，
+  // 滚回底部自动恢复。没有这个，长回复会在视口外"盲长"。
+  const stickRef = useRef(true);
+  const handleScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  };
+  // 切换会话视为重新贴底（新会话从最新消息看起）。
+  useEffect(() => {
+    stickRef.current = true;
+  }, [stream.threadId]);
+
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) {
+    if (el && stickRef.current) {
       el.scrollTo({
         top: el.scrollHeight,
         behavior: isLoading ? "auto" : "smooth",
       });
     }
-  }, [messages.length, isLoading]);
+    // messages 身份在每次 delta 追加后都会变化：内容增长本身就是滚动信号。
+  }, [messages, isLoading]);
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -46,6 +60,7 @@ export function ChatInterface() {
     <div className="flex flex-1 flex-col overflow-hidden">
       <div
         ref={scrollRef}
+        onScroll={handleScroll}
         className="flex-1 overflow-x-hidden overflow-y-auto overscroll-contain"
       >
         <div className="mx-auto w-full max-w-[900px] px-6 pt-4 pb-6">
