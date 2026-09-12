@@ -8,7 +8,11 @@ import { ChatMessage } from "./ChatMessage";
 import { uploadDocument, type UploadedFile } from "@/providers/agentBaseClient";
 import { useStreamContext } from "@/providers/Stream";
 
-const ATTACHMENT_ACCEPT = ".pdf,.docx,.txt,.md,.markdown";
+// 图片（png/jpg/webp/gif）走多模态通道：vision 模型直接看图。
+const ATTACHMENT_ACCEPT =
+  ".pdf,.docx,.txt,.md,.markdown,.png,.jpg,.jpeg,.webp,.gif";
+// 与后端 IMAGE_STORED_FORMATS 对齐：这些 format 的附件是图片，chip 可显示缩略图。
+const IMAGE_STORED_FORMATS = new Set(["png", "jpeg", "webp", "gif"]);
 
 // 上传进行中的条目：chip 显示进度条，完成后转为正式附件。
 interface PendingUpload {
@@ -25,6 +29,8 @@ export function ChatInterface() {
   const uploading = pending.length > 0;
   const [dragActive, setDragActive] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // 图片缩略图：file_id -> 本地 objectURL（仅输入区 chip 使用）。
+  const [previews, setPreviews] = useState<Record<string, string>>({});
   const scrollRef = useRef<HTMLDivElement>(null);
   // 发送后立即清空；若这一轮在收到任何回复前失败，把草稿放回来，
   // 避免用户的长文本凭空丢失（只能改小重发）。
@@ -73,6 +79,10 @@ export function ChatInterface() {
               prev.map((p) => (p.key === key ? { ...p, progress: percent } : p)),
             ),
         });
+        if (IMAGE_STORED_FORMATS.has(uploaded.format)) {
+          // 图片附件：chip 里显示本地缩略图（revoke 挂在移除时）。
+          setPreviews((prev) => ({ ...prev, [uploaded.file_id]: URL.createObjectURL(file) }));
+        }
         setAttachments((prev) => [...prev, uploaded]);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -97,6 +107,12 @@ export function ChatInterface() {
   };
 
   const removeAttachment = (fileId: string) => {
+    setPreviews((prev) => {
+      if (prev[fileId]) URL.revokeObjectURL(prev[fileId]);
+      const next = { ...prev };
+      delete next[fileId];
+      return next;
+    });
     setAttachments((prev) => prev.filter((a) => a.file_id !== fileId));
   };
 
@@ -191,7 +207,15 @@ export function ChatInterface() {
                 className="border-border bg-muted flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs"
                 key={a.file_id}
               >
-                <FileText className="size-3.5 text-blue-500" />
+                {previews[a.file_id] ? (
+                  <img
+                    alt={a.filename}
+                    className="size-5 rounded object-cover"
+                    src={previews[a.file_id]}
+                  />
+                ) : (
+                  <FileText className="size-3.5 text-blue-500" />
+                )}
                 <span className="max-w-40 truncate font-medium">{a.filename}</span>
                 <span className="text-muted-foreground">
                   {a.format}
