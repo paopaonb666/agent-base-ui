@@ -8,7 +8,12 @@ import React, {
   useEffect,
 } from "react";
 import { toast } from "sonner";
-import { useThreads, type ThreadMessage, type ThreadStatus } from "./Thread";
+import {
+  useThreads,
+  type AttachmentMeta,
+  type ThreadMessage,
+  type ThreadStatus,
+} from "./Thread";
 import {
   AgentBaseEvent,
   fetchThreadHistory,
@@ -38,7 +43,7 @@ export interface StreamState {
   setApiUrl: (value: string) => void;
   setModule: (value: string) => void;
   setThreadId: (value: string | null) => void;
-  sendMessage: (text: string) => Promise<SendMessageResult>;
+  sendMessage: (text: string, attachments?: AttachmentMeta[]) => Promise<SendMessageResult>;
   stop: () => void;
   resetThread: () => void;
   /** 该线程是否正在流式对话（按线程追踪，与活跃视图无关）。渲染期调用，
@@ -61,7 +66,14 @@ function replayToUiMessages(messages: ThreadHistoryMessage[]): UiMessage[] {
   const byCallId = new Map<string, number>();
   messages.forEach((message, index) => {
     if (message.role === "human") {
-      out.push({ id: `h-history-${index}`, role: "human", content: message.content ?? "" });
+      out.push({
+        id: `h-history-${index}`,
+        role: "human",
+        content: message.content ?? "",
+        ...(message.attachments && message.attachments.length > 0
+          ? { attachments: message.attachments }
+          : {}),
+      });
       return;
     }
     if (message.role === "assistant") {
@@ -309,7 +321,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   }, [threadId, getThreadMessages, getThread, finalApiUrl, finalModule, setTranscript]);
 
   const sendMessage = useCallback(
-    async (text: string): Promise<SendMessageResult> => {
+    async (text: string, attachments?: AttachmentMeta[]): Promise<SendMessageResult> => {
       if (!finalApiUrl || !finalModule) return { ok: false, draft: text };
       if (!text.trim()) return { ok: false, draft: text };
 
@@ -337,7 +349,12 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         [];
       let transcript: UiMessage[] = [
         ...seed,
-        { id: humanId, role: "human", content: text.trim() },
+        {
+          id: humanId,
+          role: "human",
+          content: text.trim(),
+          ...(attachments && attachments.length > 0 ? { attachments } : {}),
+        },
       ];
       setTranscript(turnThreadId, transcript);
       setError(null);
@@ -386,6 +403,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           module: turnModule,
           message: text.trim(),
           threadId: turnThreadId,
+          attachments: attachments?.map((a) => a.file_id),
           requestId: rid,
           signal: controller.signal,
         });

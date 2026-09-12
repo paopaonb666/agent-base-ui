@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { CircleStop, FileText, Paperclip, SendHorizontal, X } from "lucide-react";
 import { toast } from "sonner";
@@ -10,11 +10,20 @@ import { useStreamContext } from "@/providers/Stream";
 
 const ATTACHMENT_ACCEPT = ".pdf,.docx,.txt,.md,.markdown";
 
+// 上传进行中的条目：chip 显示进度条，完成后转为正式附件。
+interface PendingUpload {
+  key: string;
+  filename: string;
+  progress: number;
+}
+
 export function ChatInterface() {
   const stream = useStreamContext();
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
-  const [uploading, setUploading] = useState(false);
+  const [pending, setPending] = useState<PendingUpload[]>([]);
+  const uploading = pending.length > 0;
+  const [dragActive, setDragActive] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   // 发送后立即清空；若这一轮在收到任何回复前失败，把草稿放回来，
@@ -49,15 +58,20 @@ export function ChatInterface() {
     // messages 身份在每次 delta 追加后都会变化：内容增长本身就是滚动信号。
   }, [messages, isLoading]);
 
-  const handleFiles = async (files: FileList | null) => {
-    if (!files || files.length === 0 || uploading) return;
+  const handleFiles = async (files: FileList | File[] | null) => {
+    if (!files || uploading) return;
     for (const file of Array.from(files)) {
-      setUploading(true);
+      const key = `${file.name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      setPending((prev) => [...prev, { key, filename: file.name, progress: 0 }]);
       try {
         const uploaded = await uploadDocument({
           apiUrl: stream.apiUrl,
           module: stream.module,
           file,
+          onProgress: (percent) =>
+            setPending((prev) =>
+              prev.map((p) => (p.key === key ? { ...p, progress: percent } : p)),
+            ),
         });
         setAttachments((prev) => [...prev, uploaded]);
       } catch (err) {
@@ -69,10 +83,17 @@ export function ChatInterface() {
           closeButton: true,
         });
       } finally {
-        setUploading(false);
+        setPending((prev) => prev.filter((p) => p.key !== key));
       }
     }
     if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const handleDrop = (e: DragEvent<HTMLElement>) => {
+    e.preventDefault();
+    setDragActive(false);
+    if (isLoading) return;
+    void handleFiles(e.dataTransfer?.files ?? null);
   };
 
   const removeAttachment = (fileId: string) => {
@@ -82,27 +103,29 @@ export function ChatInterface() {
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     const text = input.trim();
-    if ((!text && attachments.length === 0) || isLoading) return;
-    // 附件正文组合进消息：后端解析出的文本随消息进入对话上下文，
-    // 模型即可阅读；附件头让模型的引用有据可查。
-    const attachmentBlock = attachments
-      .map(
-        (a) =>
-          `[附件：${a.filename}（${a.format}${a.pages ? `，${a.pages} 页` : ""}，` +
-          `${a.text_len} 字符${a.truncated ? "，已截断" : ""}）]\n${a.text}\n[/附件]`,
-      )
-      .join("\n\n");
-    const composed = attachmentBlock
-      ? `${attachmentBlock}\n\n${text || "请阅读上面的附件内容。"}`
-      : text;
+    if ((!text && attachments.length === 0) || isLoading || pending.length > 0) return;
+    const attachmentMeta = attachments.map((a) => ({
+      file_id: a.file_id,
+      filename: a.filename,
+      format: a.format,
+      pages: a.pages,
+      text_len: a.text_len,
+    }));
+    const composed =
+      text || (attachments.length > 0 ? "请阅读上面的附件内容。" : "");
     draftRef.current = text;
     setInput("");
     setAttachments([]);
-    void stream.sendMessage(composed).then((result) => {
+    void stream.sendMessage(composed, attachmentMeta).then((result) => {
       if (!result.ok && !stream.isLoading) {
         // 发送失败：恢复草稿与附件（若期间用户已输入新内容则不覆盖）。
         setInput((prev) => (prev ? prev : (result.draft ?? draftRef.current)));
-        setAttachments((prev) => (prev.length > 0 ? prev : attachments));
+        setAttachments((prev) => (prev.length > 0 ? prev : attachmentMeta.map((m) => ({
+          ...m,
+          paragraphs: null,
+          truncated: false,
+          warning: null,
+        }))));
       }
     });
   };
@@ -143,19 +166,42 @@ export function ChatInterface() {
             {stream.error}
           </div>
         )}
-        {attachments.length > 0 && (
+        {(attachments.length > 0 || pending.length > 0) && (
           <div className="mx-auto mb-2 flex max-w-[900px] flex-wrap gap-2">
+            {pending.map((p) => (
+              <span
+                className="border-border bg-muted flex w-64 flex-col gap-1 rounded-lg border px-2 py-1 text-xs"
+                key={p.key}
+              >
+                <span className="flex items-center gap-1.5">
+                  <FileText className="size-3.5 text-blue-400" />
+                  <span className="max-w-40 truncate font-medium">{p.filename}</span>
+                  <span className="text-muted-foreground">{p.progress}%</span>
+                </span>
+                <span className="bg-border h-1 w-full overflow-hidden rounded-full">
+                  <span
+                    className="bg-blue-500 block h-full transition-all"
+                    style={{ width: `${p.progress}%` }}
+                  />
+                </span>
+              </span>
+            ))}
             {attachments.map((a) => (
               <span
                 className="border-border bg-muted flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs"
                 key={a.file_id}
               >
                 <FileText className="size-3.5 text-blue-500" />
-                <span className="max-w-48 truncate font-medium">{a.filename}</span>
+                <span className="max-w-40 truncate font-medium">{a.filename}</span>
                 <span className="text-muted-foreground">
                   {a.format}
                   {a.pages ? ` · ${a.pages} 页` : ""} · {a.text_len} 字符
                 </span>
+                {a.warning ? (
+                  <span className="text-amber-600" title={a.warning}>
+                    ⚠
+                  </span>
+                ) : null}
                 <button
                   aria-label={`移除附件 ${a.filename}`}
                   className="text-muted-foreground hover:text-foreground"
@@ -170,7 +216,17 @@ export function ChatInterface() {
         )}
         <form
           onSubmit={handleSubmit}
-          className="border-input bg-background mx-auto flex w-full max-w-[900px] items-end gap-2 rounded-xl border p-2 shadow-xs"
+          onDragLeave={(e) => {
+            if (e.currentTarget === e.target) setDragActive(false);
+          }}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragActive(true);
+          }}
+          onDrop={handleDrop}
+          className={`border-input bg-background mx-auto flex w-full max-w-[900px] items-end gap-2 rounded-xl border p-2 shadow-xs ${
+            dragActive ? "border-blue-500 bg-blue-50/40" : ""
+          }`}
         >
           <input
             accept={ATTACHMENT_ACCEPT}
@@ -186,7 +242,7 @@ export function ChatInterface() {
             disabled={uploading || isLoading}
             onClick={() => fileInputRef.current?.click()}
             size="icon"
-            title="上传文档（PDF / DOCX / TXT / Markdown）"
+            title="上传或拖拽文档（PDF / DOCX / TXT / Markdown）"
             type="button"
             variant="ghost"
           >
@@ -206,7 +262,13 @@ export function ChatInterface() {
                 form?.requestSubmit();
               }
             }}
-            placeholder={isLoading ? "运行中…" : "输入您的消息…"}
+            placeholder={
+              dragActive
+                ? "松开即可添加附件…"
+                : isLoading
+                  ? "运行中…"
+                  : "输入您的消息，或拖入 PDF / DOCX / TXT / MD"
+            }
             rows={1}
             className="placeholder:text-muted-foreground field-sizing-content max-h-48 flex-1 resize-none border-0 bg-transparent px-3 py-2 text-sm leading-6 outline-none"
           />
@@ -223,7 +285,7 @@ export function ChatInterface() {
             ) : (
               <Button
                 type="submit"
-                disabled={!input.trim() && attachments.length === 0}
+                disabled={(!input.trim() && attachments.length === 0) || pending.length > 0}
               >
                 <SendHorizontal className="h-4 w-4" />
                 发送

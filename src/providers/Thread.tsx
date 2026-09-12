@@ -28,6 +28,15 @@ const MAX_THREADS = 50;
 // endpoint (thin base), so the UI persists the transcript it already renders
 // and replays it when a past thread is reopened. The backend checkpointer
 // independently restores *context* for follow-up turns.
+// 上传附件元数据（M4b）：human 气泡渲染 chip，正文保持用户输入原文。
+export interface AttachmentMeta {
+  file_id: string;
+  filename: string;
+  format: string;
+  pages?: number | null;
+  text_len: number;
+}
+
 // 引用来源（web_search 等工具经 sources 事件发布；附着在回复旁渲染）。
 export interface SourceRef {
   title: string;
@@ -35,7 +44,7 @@ export interface SourceRef {
 }
 
 export type ThreadMessage =
-  | { id: string; role: "human"; content: string }
+  | { id: string; role: "human"; content: string; attachments?: AttachmentMeta[] }
   | { id: string; role: "assistant"; content: string }
   | {
       id: string;
@@ -117,7 +126,31 @@ function sanitizeMessages(messages: unknown): ThreadMessage[] {
       // 修复历史遗留的 "[object Object]"：非字符串内容一律丢弃该消息，
       // 而不是把 String(obj) 渲染给用户。
       if (typeof m.content !== "string" || !m.content) continue;
-      out.push({ id, role, content: m.content });
+      const rawAtts: unknown = m.attachments;
+      out.push({
+        id,
+        role,
+        content: m.content,
+        ...(role === "human" && Array.isArray(rawAtts)
+          ? {
+              attachments: (rawAtts as Record<string, unknown>[])
+                .filter(
+                  (a) =>
+                    typeof a === "object" &&
+                    a !== null &&
+                    typeof a.file_id === "string" &&
+                    typeof a.filename === "string",
+                )
+                .map((a) => ({
+                  file_id: String(a.file_id),
+                  filename: String(a.filename),
+                  format: String(a.format ?? ""),
+                  pages: typeof a.pages === "number" ? a.pages : null,
+                  text_len: typeof a.text_len === "number" ? a.text_len : 0,
+                })),
+            }
+          : {}),
+      });
     } else if (role === "tool") {
       const status =
         m.status === "completed" || m.status === "error" ? m.status : "error";

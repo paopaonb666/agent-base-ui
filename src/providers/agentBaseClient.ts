@@ -49,8 +49,18 @@ export interface InvokeAgentArgs {
   module: string;
   message: string;
   threadId?: string | null;
+  /** 附件对话（M4b）：本条消息引用的上传文件 id。 */
+  attachments?: string[];
   requestId?: string;
   signal?: AbortSignal;
+}
+
+export interface ThreadHistoryAttachment {
+  file_id: string;
+  filename: string;
+  format: string;
+  pages?: number | null;
+  text_len: number;
 }
 
 export interface ThreadHistoryToolCall {
@@ -64,6 +74,8 @@ export interface ThreadHistoryMessage {
   role: "human" | "assistant" | "tool";
   content?: string;
   name?: string;
+  /** 仅 human：本条消息引用的上传附件元数据。 */
+  attachments?: ThreadHistoryAttachment[];
   /** 仅 assistant：本条消息发起的工具调用（调用参数在此）。 */
   tool_calls?: ThreadHistoryToolCall[];
   /** 仅 tool：与发起方 AI 消息的 tool_calls[id] 配对。 */
@@ -85,28 +97,48 @@ export interface UploadedFile {
   paragraphs: number | null;
   truncated: boolean;
   text_len: number;
-  text: string;
+  warning?: string | null;
 }
 
 /**
  * 上传并解析文档（M4a 解析层的 HTTP 入口）。后端按扩展名推断格式，
  * 解析失败以 400 返回可读原因；文本经 DOC_PARSE_MAX_OUTPUT_CHARS 截断。
  */
-export async function uploadDocument(args: {
+export function uploadDocument(args: {
   apiUrl: string;
   module: string;
   file: File;
+  onProgress?: (percent: number) => void;
   signal?: AbortSignal;
 }): Promise<UploadedFile> {
-  const { apiUrl, module, file, signal } = args;
+  // fetch 不支持上传进度：用 XHR 拿 determinate 百分比。
+  const { apiUrl, module, file, onProgress, signal } = args;
   const form = new FormData();
   form.append("file", file);
   const url = `${apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(module)}/files`;
-  const response = await fetch(url, { method: "POST", body: form, signal });
-  if (!response.ok) {
-    throw new Error(await extractErrorDetail(response));
-  }
-  return (await response.json()) as UploadedFile;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.responseType = "json";
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        onProgress?.(Math.round((event.loaded / event.total) * 100));
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(xhr.response as UploadedFile);
+        return;
+      }
+      const body = xhr.response as { detail?: unknown } | null;
+      const detail = typeof body?.detail === "string" ? body.detail : `上传失败（${xhr.status}）`;
+      reject(new Error(detail));
+    };
+    xhr.onerror = () => reject(new Error("网络错误，上传失败"));
+    xhr.onabort = () => reject(new Error("上传已取消"));
+    signal?.addEventListener("abort", () => xhr.abort(), { once: true });
+    xhr.send(form);
+  });
 }
 
 /**
@@ -340,6 +372,7 @@ export async function* invokeAgent(
     module,
     message,
     threadId,
+    attachments,
     requestId: rid = requestId(),
     signal,
   } = args;
@@ -353,6 +386,7 @@ export async function* invokeAgent(
     body: JSON.stringify({
       message,
       ...(threadId ? { thread_id: threadId } : {}),
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
     }),
     signal,
   });

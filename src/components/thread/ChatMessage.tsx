@@ -1,6 +1,7 @@
 "use client";
 
 import { memo } from "react";
+import { FileText } from "lucide-react";
 import { ExternalLink } from "lucide-react";
 import { UiMessage } from "@/providers/Stream";
 import { MarkdownText } from "./markdown-text";
@@ -102,6 +103,23 @@ export const ChatMessage = memo(function ChatMessage({
           className="border-border text-foreground max-w-[70%] overflow-hidden rounded-2xl rounded-br-sm border px-3 py-2 text-sm leading-relaxed break-words"
           style={{ backgroundColor: "var(--color-user-message-bg)" }}
         >
+          {message.attachments?.length ? (
+            <div className="mb-2 flex flex-wrap justify-end gap-1.5">
+              {message.attachments.map((a) => (
+                <span
+                  className="border-border bg-background flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs"
+                  key={a.file_id}
+                >
+                  <FileText className="size-3 text-blue-500" />
+                  <span className="max-w-40 truncate">{a.filename}</span>
+                  <span className="text-muted-foreground">
+                    {a.format}
+                    {a.pages ? ` · ${a.pages} 页` : ""} · {a.text_len} 字符
+                  </span>
+                </span>
+              ))}
+            </div>
+          ) : null}
           <p className="m-0 break-words whitespace-pre-wrap">
             {message.content}
           </p>
