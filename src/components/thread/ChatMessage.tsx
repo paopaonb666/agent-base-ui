@@ -38,9 +38,12 @@ function AssistantMessage({
 export const ChatMessage = memo(function ChatMessage({
   message,
   isStreaming,
+  onOpenFile,
 }: {
   message: UiMessage;
   isStreaming?: boolean;
+  /** 点击附件 chip 打开文档预览与切片可视化（M7）。 */
+  onOpenFile?: (file: { file_id: string; filename: string; format: string }) => void;
 }) {
   if (message.role === "tool") {
     return (
@@ -106,9 +109,18 @@ export const ChatMessage = memo(function ChatMessage({
           {message.attachments?.length ? (
             <div className="mb-2 flex flex-wrap justify-end gap-1.5">
               {message.attachments.map((a) => (
-                <span
-                  className="border-border bg-background flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs"
+                <button
+                  className="border-border bg-background hover:border-blue-300 flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs transition-colors"
                   key={a.file_id}
+                  onClick={() =>
+                    onOpenFile?.({
+                      file_id: a.file_id,
+                      filename: a.filename,
+                      format: a.format,
+                    })
+                  }
+                  title="点击查看文档预览与切片方式"
+                  type="button"
                 >
                   <FileText className="size-3 text-blue-500" />
                   <span className="max-w-40 truncate">{a.filename}</span>
@@ -116,7 +128,7 @@ export const ChatMessage = memo(function ChatMessage({
                     {a.format}
                     {a.pages ? ` · ${a.pages} 页` : ""} · {a.text_len} 字符
                   </span>
-                </span>
+                </button>
               ))}
             </div>
           ) : null}

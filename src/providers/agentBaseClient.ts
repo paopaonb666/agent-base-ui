@@ -452,3 +452,101 @@ async function readChunkWithTimeout(
     clearTimeout(timer);
   }
 }
+
+// ── 文档预览与切片可视化（M7） ─────────────────────────────────────
+
+/** GET …/files/{id}/preview 的返回：元信息 + 提取正文（与注入模型的内容同源）。 */
+export interface FilePreview {
+  file_id: string;
+  filename: string;
+  format: string;
+  pages: number | null;
+  text_len: number;
+  truncated: boolean;
+  warning?: string | null;
+  extracted_text: string;
+}
+
+/** 一个切片的原文区间（段落打包块是多区间；旧数据为 null）。 */
+export type ChunkOffsets = [number, number][];
+
+/** GET …/files/{id}/chunks 返回的一个切片。 */
+export interface FileChunkView {
+  chunk_id: string;
+  ordinal: number;
+  text: string;
+  offsets: ChunkOffsets | null;
+  char_len: number;
+  has_embedding: boolean;
+  embedding_dim: number | null;
+}
+
+/** 拉取文档预览（元信息 + 提取正文）。 */
+export async function fetchFilePreview(args: {
+  apiUrl: string;
+  module: string;
+  fileId: string;
+  /** 记忆身份（X-User-Id），与后端属主校验配套。 */
+  userId?: string;
+  signal?: AbortSignal;
+}): Promise<FilePreview> {
+  const { apiUrl, module, fileId, userId, signal } = args;
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(module)}/files/${encodeURIComponent(fileId)}/preview`;
+  const response = await fetch(url, {
+    headers: userId ? { "X-User-Id": userId } : undefined,
+    signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  return (await response.json()) as FilePreview;
+}
+
+/** 拉取文档的切片存储视图（序号/原文区间/向量化状态）。 */
+export async function fetchFileChunks(args: {
+  apiUrl: string;
+  module: string;
+  fileId: string;
+  userId?: string;
+  signal?: AbortSignal;
+}): Promise<FileChunkView[]> {
+  const { apiUrl, module, fileId, userId, signal } = args;
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(module)}/files/${encodeURIComponent(fileId)}/chunks`;
+  const response = await fetch(url, {
+    headers: userId ? { "X-User-Id": userId } : undefined,
+    signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  const body = (await response.json()) as { chunks?: unknown };
+  if (!Array.isArray(body.chunks)) return [];
+  // 防御性收窄：形态不完整的条目直接丢弃（与 listThreads 同语义）。
+  return body.chunks.filter(
+    (c: unknown): c is FileChunkView =>
+      typeof c === "object" &&
+      c !== null &&
+      typeof (c as FileChunkView).chunk_id === "string" &&
+      typeof (c as FileChunkView).text === "string" &&
+      typeof (c as FileChunkView).ordinal === "number",
+  );
+}
+
+/**
+ * 拉取原始文件字节并转成 objectURL（图片预览 <img src> / 原文下载链接）。
+ * 走 fetch 而非直接 <img src> 是为了带上 X-User-Id 头做属主校验——
+ * 身份不进 URL。调用方负责在不需要时 URL.revokeObjectURL。
+ */
+export async function fetchFileRawObjectUrl(args: {
+  apiUrl: string;
+  module: string;
+  fileId: string;
+  userId?: string;
+  signal?: AbortSignal;
+}): Promise<string> {
+  const { apiUrl, module, fileId, userId, signal } = args;
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(module)}/files/${encodeURIComponent(fileId)}/raw`;
+  const response = await fetch(url, {
+    headers: userId ? { "X-User-Id": userId } : undefined,
+    signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  const blob = await response.blob();
+  return URL.createObjectURL(blob);
+}

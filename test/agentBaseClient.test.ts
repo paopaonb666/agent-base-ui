@@ -6,6 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   deleteThread,
   extractErrorDetail,
+  fetchFileChunks,
+  fetchFilePreview,
+  fetchFileRawObjectUrl,
   fetchHealth,
   fetchThreadHistory,
   invokeAgent,
@@ -234,5 +237,105 @@ describe("fetchThreadHistory / fetchHealth / listModules", () => {
     );
     const mods = await listModules({ apiUrl: "http://b" });
     expect(mods).toEqual([{ name: "chat", description: "对话" }]);
+  });
+});
+
+describe("文档预览与切片可视化（M7）", () => {
+  it("fetchFilePreview 拉取元信息与提取正文", async () => {
+    const fetchMock = vi.fn(async (_url?: string, _init?: RequestInit) =>
+      jsonResponse({
+        file_id: "f1",
+        filename: "报告.txt",
+        format: "txt",
+        pages: null,
+        text_len: 12,
+        truncated: false,
+        extracted_text: "第一段的内容。",
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const preview = await fetchFilePreview({
+      apiUrl: "http://b",
+      module: "chat",
+      fileId: "f1",
+      userId: "alice",
+    });
+    expect(preview.extracted_text).toBe("第一段的内容。");
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://b/v1/agents/chat/files/f1/preview",
+    );
+    const [, init] = fetchMock.mock.calls[0];
+    expect((init as RequestInit).headers).toEqual({ "X-User-Id": "alice" });
+  });
+
+  it("fetchFileChunks 返回切片列表并防御性收窄", async () => {
+    const fetchMock = vi.fn(async (_url?: string) =>
+      jsonResponse({
+        chunks: [
+          {
+            chunk_id: "c1",
+            ordinal: 0,
+            text: "第一段的内容。",
+            offsets: [[0, 7]],
+            char_len: 7,
+            has_embedding: true,
+            embedding_dim: 1024,
+          },
+          { broken: true },
+        ],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const chunks = await fetchFileChunks({
+      apiUrl: "http://b/",
+      module: "chat",
+      fileId: "f1",
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://b/v1/agents/chat/files/f1/chunks",
+    );
+    // 防御性收窄：坏形态条目被丢弃，完整条目保留。
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].chunk_id).toBe("c1");
+    expect(chunks[0].offsets).toEqual([[0, 7]]);
+  });
+
+  it("fetchFileChunks 透传非 2xx 的可读错误", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ detail: "文件不存在：f9" }, 404)),
+    );
+    await expect(
+      fetchFileChunks({ apiUrl: "http://b", module: "chat", fileId: "f9" }),
+    ).rejects.toThrow("文件不存在：f9");
+  });
+
+  it("fetchFileRawObjectUrl 把字节流转成 objectURL", async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const fetchMock = vi.fn(
+      async (_url?: string) =>
+        new Response(bytes, {
+          status: 200,
+          headers: { "Content-Type": "image/png" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    // node 环境没有 createObjectURL：stub 掉并验证调用链。
+    const createSpy = vi
+      .spyOn(URL, "createObjectURL")
+      .mockImplementation(() => "blob:mock-object-url");
+    const revokeSpy = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    const url = await fetchFileRawObjectUrl({
+      apiUrl: "http://b",
+      module: "chat",
+      fileId: "img1",
+      userId: "alice",
+    });
+    expect(url).toBe("blob:mock-object-url");
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://b/v1/agents/chat/files/img1/raw",
+    );
+    createSpy.mockRestore();
+    revokeSpy.mockRestore();
   });
 });

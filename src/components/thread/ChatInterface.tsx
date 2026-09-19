@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState, type DragEvent, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type DragEvent, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { CircleStop, FileText, Paperclip, SendHorizontal, X } from "lucide-react";
 import { toast } from "sonner";
 import { ChatMessage } from "./ChatMessage";
+import { FilePreviewDialog, type PreviewTarget } from "./FilePreviewDialog";
 import { uploadDocument, type UploadedFile } from "@/providers/agentBaseClient";
 import { useStreamContext } from "@/providers/Stream";
 
@@ -31,6 +32,11 @@ export function ChatInterface() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   // 图片缩略图：file_id -> 本地 objectURL（仅输入区 chip 使用）。
   const [previews, setPreviews] = useState<Record<string, string>>({});
+  // 附件预览对话框（M7）：点击 chip 查看文档预览与切片存储方式。
+  const [previewFile, setPreviewFile] = useState<PreviewTarget | null>(null);
+  const openFilePreview = useCallback((target: PreviewTarget) => {
+    setPreviewFile(target);
+  }, []);
   const scrollRef = useRef<HTMLDivElement>(null);
   // 发送后立即清空；若这一轮在收到任何回复前失败，把草稿放回来，
   // 避免用户的长文本凭空丢失（只能改小重发）。
@@ -170,6 +176,7 @@ export function ChatInterface() {
                 key={m.id || `${m.role}-${i}`}
                 message={m}
                 isStreaming={isLoading && i === messages.length - 1}
+                onOpenFile={openFilePreview}
               />
             ))}
           </div>
@@ -204,8 +211,13 @@ export function ChatInterface() {
             ))}
             {attachments.map((a) => (
               <span
-                className="border-border bg-muted flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs"
+                className="border-border bg-muted hover:border-blue-300 flex cursor-pointer items-center gap-1.5 rounded-lg border px-2 py-1 text-xs transition-colors"
                 key={a.file_id}
+                onClick={() =>
+                  setPreviewFile({ file_id: a.file_id, filename: a.filename, format: a.format })
+                }
+                role="button"
+                title="点击查看文档预览与切片方式"
               >
                 {previews[a.file_id] ? (
                   <img
@@ -229,7 +241,10 @@ export function ChatInterface() {
                 <button
                   aria-label={`移除附件 ${a.filename}`}
                   className="text-muted-foreground hover:text-foreground"
-                  onClick={() => removeAttachment(a.file_id)}
+                  onClick={(e) => {
+                    e.stopPropagation(); // 不触发 chip 的预览打开
+                    removeAttachment(a.file_id);
+                  }}
                   type="button"
                 >
                   <X className="size-3.5" />
@@ -318,6 +333,15 @@ export function ChatInterface() {
           </div>
         </form>
       </div>
+      {previewFile ? (
+        <FilePreviewDialog
+          file={previewFile}
+          onOpenChange={(o) => {
+            if (!o) setPreviewFile(null);
+          }}
+          open
+        />
+      ) : null}
     </div>
   );
 }
