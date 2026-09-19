@@ -625,23 +625,27 @@ export interface MemoryItem {
   has_embedding: boolean;
   created_at: number;
   updated_at: number;
+  /** episodic 超过 TTL：召回时已自动失效，保留与否由人工判断。 */
+  expired?: boolean;
   /** 仅 q 检索模式携带：混合相关度得分。 */
   score?: number;
 }
 
-/** 浏览/检索长期记忆（q 存在→混合检索，否则按更新时间浏览）。 */
+/** 浏览/检索长期记忆（q 存在→混合检索[仅启用中]，否则按更新时间浏览全部状态）。 */
 export async function fetchMemories(args: {
   apiUrl: string;
   query?: string;
   kind?: MemoryKind;
+  status?: "active" | "archived" | "superseded";
   limit?: number;
   userId?: string;
   signal?: AbortSignal;
 }): Promise<MemoryItem[]> {
-  const { apiUrl, query, kind, limit, userId, signal } = args;
+  const { apiUrl, query, kind, status, limit, userId, signal } = args;
   const params = new URLSearchParams();
   if (query) params.set("q", query);
   if (kind) params.set("kind", kind);
+  if (status) params.set("status", status);
   if (limit) params.set("limit", String(limit));
   const qs = params.toString();
   const url = `${apiUrl.replace(/\/+$/, "")}/v1/memory${qs ? `?${qs}` : ""}`;
@@ -659,6 +663,28 @@ export async function fetchMemories(args: {
       typeof (m as MemoryItem).memory_id === "string" &&
       typeof (m as MemoryItem).content === "string",
   );
+}
+
+/** 更新长期记忆状态：archived（停用/保留但不召回）| active（重新启用）。 */
+export async function updateMemoryStatus(args: {
+  apiUrl: string;
+  memoryId: string;
+  status: "active" | "archived" | "superseded";
+  userId?: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const { apiUrl, memoryId, status, userId, signal } = args;
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/memory/${encodeURIComponent(memoryId)}`;
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      ...(userId ? { "X-User-Id": userId } : {}),
+    },
+    body: JSON.stringify({ status }),
+    signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
 }
 
 /** 删除一条长期记忆。 */

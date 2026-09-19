@@ -6,7 +6,19 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, BookOpen, Brain, FileText, RefreshCw, Search, Trash2, Upload, UserRound } from "lucide-react";
+import {
+  Archive,
+  ArrowLeft,
+  BookOpen,
+  Brain,
+  FileText,
+  RefreshCw,
+  Search,
+  Trash2,
+  Undo2,
+  Upload,
+  UserRound,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -15,6 +27,7 @@ import { useStreamContext } from "@/providers/Stream";
 import {
   deleteMemory,
   fetchMemories,
+  updateMemoryStatus,
   fetchProfile,
   listKnowledgeFiles,
   revokeFile,
@@ -49,6 +62,7 @@ export function KnowledgePage() {
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const [memQuery, setMemQuery] = useState("");
   const [memKind, setMemKind] = useState<MemoryKind | "">("");
+  const [memStatus, setMemStatus] = useState<"active" | "archived" | "superseded" | "">("");
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [previewFile, setPreviewFile] = useState<PreviewTarget | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -70,12 +84,13 @@ export function KnowledgePage() {
         apiUrl: stream.apiUrl,
         query: memQuery.trim() || undefined,
         kind: memKind || undefined,
+        status: memStatus || undefined,
         limit: 100,
         signal,
       });
       setMemories(list);
     },
-    [stream.apiUrl, memQuery, memKind],
+    [stream.apiUrl, memQuery, memKind, memStatus],
   );
 
   const loadProfile = useCallback(
@@ -148,6 +163,33 @@ export function KnowledgePage() {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       toast.error("撤销失败", {
+        description: <p className="max-w-80 break-all">{message}</p>,
+        duration: 8000,
+        richColors: true,
+        closeButton: true,
+      });
+    }
+  };
+
+  const handleToggleMemoryStatus = async (target: MemoryItem) => {
+    const next = target.status === "active" ? "archived" : "active";
+    try {
+      await updateMemoryStatus({
+        apiUrl: stream.apiUrl,
+        memoryId: target.memory_id,
+        status: next,
+      });
+      if (next === "active") {
+        // 重新启用会刷新 updated_at，TTL 窗口随之重置——过期标志消失。
+        await loadMemories();
+      } else {
+        setMemories((prev) =>
+          prev.map((m) => (m.memory_id === target.memory_id ? { ...m, status: next } : m)),
+        );
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(next === "archived" ? "停用记忆失败" : "启用记忆失败", {
         description: <p className="max-w-80 break-all">{message}</p>,
         duration: 8000,
         richColors: true,
@@ -351,6 +393,20 @@ export function KnowledgePage() {
                     <option value="episodic">情节</option>
                     <option value="procedural">程序</option>
                   </select>
+                  <select
+                    className="border-input bg-background rounded-lg border px-2 py-1.5 text-sm"
+                    onChange={(e) =>
+                      setMemStatus(
+                        e.target.value as "active" | "archived" | "superseded" | "",
+                      )
+                    }
+                    value={memStatus}
+                  >
+                    <option value="">全部状态</option>
+                    <option value="active">启用中</option>
+                    <option value="archived">已归档</option>
+                    <option value="superseded">已废弃</option>
+                  </select>
                   <Button
                     onClick={() => void loadMemories()}
                     size="sm"
@@ -362,7 +418,7 @@ export function KnowledgePage() {
                 {memories.length === 0 ? (
                   <p className="text-muted-foreground py-10 text-center text-sm">
                     没有匹配的长期记忆——它们随对话由后台管线自动形成，或在对话里让 agent
-                    调用 memory_save。
+                    调用 memory_save；可调整类型/状态筛选查看已归档与已废弃的记忆。
                   </p>
                 ) : (
                   memories.map((m) => (
@@ -383,21 +439,57 @@ export function KnowledgePage() {
                       </span>
                       <div className="min-w-0 flex-1">
                         <p className="text-sm leading-relaxed break-words">{m.content}</p>
-                        <p className="text-muted-foreground mt-1 text-xs">
-                          显著度 {m.salience.toFixed(1)} · 被召回 {m.access_count} 次 ·{" "}
-                          {formatTime(m.updated_at)}
-                          {m.tags.length > 0 ? ` · ${m.tags.join("、")}` : ""}
-                          {m.status !== "active" ? ` · ${m.status}` : ""}
+                        <p className="text-muted-foreground mt-1 flex flex-wrap items-center gap-1.5 text-xs">
+                          {m.status === "active" ? (
+                            m.expired ? (
+                              <span className="rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700">
+                                已过期（不再召回）
+                              </span>
+                            ) : (
+                              <span className="rounded bg-emerald-100 px-1.5 py-0.5 font-medium text-emerald-700">
+                                启用中
+                              </span>
+                            )
+                          ) : (
+                            <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 font-medium">
+                              {m.status === "archived" ? "已归档" : "已废弃"}
+                            </span>
+                          )}
+                          <span>创建 {formatTime(m.created_at)}</span>
+                          <span>更新 {formatTime(m.updated_at)}</span>
+                          <span>
+                            显著度 {m.salience.toFixed(1)} · 被召回 {m.access_count} 次
+                          </span>
+                          {m.tags.length > 0 ? <span>{m.tags.join("、")}</span> : null}
                         </p>
                       </div>
-                      <Button
-                        aria-label="删除记忆"
-                        onClick={() => void handleDeleteMemory(m)}
-                        size="icon"
-                        variant="ghost"
-                      >
-                        <Trash2 className="text-muted-foreground size-4" />
-                      </Button>
+                      <div className="flex shrink-0 items-center gap-1">
+                        <Button
+                          aria-label={m.status === "active" ? "停用记忆" : "重新启用记忆"}
+                          onClick={() => void handleToggleMemoryStatus(m)}
+                          size="icon"
+                          title={
+                            m.status === "active"
+                              ? "停用（保留但不注入召回，可随时恢复）"
+                              : "重新启用（进入召回，TTL 窗口重置）"
+                          }
+                          variant="ghost"
+                        >
+                          {m.status === "active" ? (
+                            <Archive className="text-muted-foreground size-4" />
+                          ) : (
+                            <Undo2 className="size-4 text-emerald-600" />
+                          )}
+                        </Button>
+                        <Button
+                          aria-label="删除记忆"
+                          onClick={() => void handleDeleteMemory(m)}
+                          size="icon"
+                          variant="ghost"
+                        >
+                          <Trash2 className="text-rose-500 size-4" />
+                        </Button>
+                      </div>
                     </div>
                   ))
                 )}
