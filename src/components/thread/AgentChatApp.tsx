@@ -1,8 +1,9 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { Button } from "@/components/ui/button";
-import { MessagesSquare, Settings, SquarePen } from "lucide-react";
+import { BookOpen, MessagesSquare, Settings, SquarePen } from "lucide-react";
 import { ThreadList } from "./ThreadList";
 import { ChatInterface } from "./ChatInterface";
 import { ConfigDialog } from "./ConfigDialog";
@@ -60,6 +61,12 @@ export function AgentChatApp() {
             </Button>
           </div>
           <div className="flex items-center gap-2">
+            <Button asChild variant="outline" size="sm">
+              <Link href="/knowledge">
+                <BookOpen className="mr-2 h-4 w-4" />
+                知识库
+              </Link>
+            </Button>
             <Button
               variant="outline"
               size="sm"

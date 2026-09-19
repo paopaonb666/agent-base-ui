@@ -550,3 +550,154 @@ export async function fetchFileRawObjectUrl(args: {
   const blob = await response.blob();
   return URL.createObjectURL(blob);
 }
+
+// ── 独立知识库页面 / 长期记忆可视化（M8） ──────────────────────────
+
+/** GET /v1/knowledge/files 返回的一条文件摘要（含切片数）。 */
+export interface KnowledgeFile {
+  file_id: string;
+  filename: string;
+  format: string;
+  pages: number | null;
+  text_len: number;
+  truncated: boolean;
+  user_id: string;
+  warning?: string | null;
+  chunks: number;
+  created_at: number;
+}
+
+/** 列出当前用户的全部知识库文件（用户级视图，跨模块）。 */
+export async function listKnowledgeFiles(args: {
+  apiUrl: string;
+  userId?: string;
+  signal?: AbortSignal;
+}): Promise<KnowledgeFile[]> {
+  const { apiUrl, userId, signal } = args;
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/knowledge/files`;
+  const response = await fetch(url, {
+    headers: userId ? { "X-User-Id": userId } : undefined,
+    signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  const body = (await response.json()) as { files?: unknown };
+  if (!Array.isArray(body.files)) return [];
+  return body.files.filter(
+    (f: unknown): f is KnowledgeFile =>
+      typeof f === "object" &&
+      f !== null &&
+      typeof (f as KnowledgeFile).file_id === "string" &&
+      typeof (f as KnowledgeFile).filename === "string",
+  );
+}
+
+/** 撤销一份知识库文件（原始行 + 切片级联删除）。 */
+export async function revokeFile(args: {
+  apiUrl: string;
+  module: string;
+  fileId: string;
+  userId?: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const { apiUrl, module, fileId, userId, signal } = args;
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(module)}/files/${encodeURIComponent(fileId)}`;
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: userId ? { "X-User-Id": userId } : undefined,
+    signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+}
+
+/** 长期记忆的类型（LangMem 分类法）。 */
+export type MemoryKind = "semantic" | "episodic" | "procedural";
+
+/** GET /v1/memory（或 q 检索）返回的一条记忆。 */
+export interface MemoryItem {
+  memory_id: string;
+  agent_id: string;
+  kind: MemoryKind;
+  content: string;
+  tags: string[];
+  salience: number;
+  status: string;
+  access_count: number;
+  has_embedding: boolean;
+  created_at: number;
+  updated_at: number;
+  /** 仅 q 检索模式携带：混合相关度得分。 */
+  score?: number;
+}
+
+/** 浏览/检索长期记忆（q 存在→混合检索，否则按更新时间浏览）。 */
+export async function fetchMemories(args: {
+  apiUrl: string;
+  query?: string;
+  kind?: MemoryKind;
+  limit?: number;
+  userId?: string;
+  signal?: AbortSignal;
+}): Promise<MemoryItem[]> {
+  const { apiUrl, query, kind, limit, userId, signal } = args;
+  const params = new URLSearchParams();
+  if (query) params.set("q", query);
+  if (kind) params.set("kind", kind);
+  if (limit) params.set("limit", String(limit));
+  const qs = params.toString();
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/memory${qs ? `?${qs}` : ""}`;
+  const response = await fetch(url, {
+    headers: userId ? { "X-User-Id": userId } : undefined,
+    signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  const body = (await response.json()) as { memories?: unknown };
+  if (!Array.isArray(body.memories)) return [];
+  return body.memories.filter(
+    (m: unknown): m is MemoryItem =>
+      typeof m === "object" &&
+      m !== null &&
+      typeof (m as MemoryItem).memory_id === "string" &&
+      typeof (m as MemoryItem).content === "string",
+  );
+}
+
+/** 删除一条长期记忆。 */
+export async function deleteMemory(args: {
+  apiUrl: string;
+  memoryId: string;
+  userId?: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const { apiUrl, memoryId, userId, signal } = args;
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/memory/${encodeURIComponent(memoryId)}`;
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: userId ? { "X-User-Id": userId } : undefined,
+    signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+}
+
+/** GET /v1/memory/profile 返回的用户画像（分节名 → 条目列表）。 */
+export type UserProfile = Record<string, string[]>;
+
+/** 读取当前用户的结构化画像（随对话管线自动演化）。 */
+export async function fetchProfile(args: {
+  apiUrl: string;
+  userId?: string;
+  signal?: AbortSignal;
+}): Promise<UserProfile | null> {
+  const { apiUrl, userId, signal } = args;
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/memory/profile`;
+  const response = await fetch(url, {
+    headers: userId ? { "X-User-Id": userId } : undefined,
+    signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  const body = (await response.json()) as { profile?: unknown };
+  if (typeof body.profile !== "object" || body.profile === null) return null;
+  const entries = Object.entries(body.profile as Record<string, unknown>).filter(
+    (pair): pair is [string, string[]] => Array.isArray(pair[1]),
+  );
+  return Object.fromEntries(entries);
+}

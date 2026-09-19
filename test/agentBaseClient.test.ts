@@ -4,16 +4,21 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  deleteMemory,
   deleteThread,
   extractErrorDetail,
   fetchFileChunks,
   fetchFilePreview,
   fetchFileRawObjectUrl,
   fetchHealth,
+  fetchMemories,
+  fetchProfile,
   fetchThreadHistory,
   invokeAgent,
+  listKnowledgeFiles,
   listModules,
   parseFrame,
+  revokeFile,
 } from "../src/providers/agentBaseClient";
 
 function sseResponse(frames: string[]): Response {
@@ -338,4 +343,102 @@ describe("文档预览与切片可视化（M7）", () => {
     createSpy.mockRestore();
     revokeSpy.mockRestore();
   });
+});
+
+describe("知识库页面与长期记忆（M8）", () => {
+  it("listKnowledgeFiles 返回用户文件列表并收窄坏条目", async () => {
+    const fetchMock = vi.fn(async (_url?: string) =>
+      jsonResponse({
+        files: [
+          {
+            file_id: "f1",
+            filename: "a.txt",
+            format: "txt",
+            pages: null,
+            text_len: 100,
+            truncated: false,
+            user_id: "default",
+            chunks: 3,
+            created_at: 1757600000,
+          },
+          { nope: true },
+        ],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const files = await listKnowledgeFiles({ apiUrl: "http://b", userId: "default" });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("http://b/v1/knowledge/files");
+    expect(files).toHaveLength(1);
+    expect(files[0].chunks).toBe(3);
+  });
+
+  it("fetchMemories 带 q/kind 查询参数", async () => {
+    const fetchMock = vi.fn(async (_url?: string) =>
+      jsonResponse({
+        memories: [
+          {
+            memory_id: "m1",
+            agent_id: "chat",
+            kind: "semantic",
+            content: "用户偏好简洁回答",
+            tags: ["偏好"],
+            salience: 0.8,
+            status: "active",
+            access_count: 2,
+            has_embedding: true,
+            created_at: 1757600000,
+            updated_at: 1757600000,
+            score: 0.79,
+          },
+        ],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const memories = await fetchMemories({
+      apiUrl: "http://b",
+      query: "偏好",
+      kind: "semantic",
+      limit: 10,
+    });
+    const calledUrl = String(fetchMock.mock.calls[0]?.[0]);
+    expect(calledUrl).toContain("/v1/memory?");
+    expect(calledUrl).toContain("q=");
+    expect(calledUrl).toContain("kind=semantic");
+    expect(memories[0].content).toBe("用户偏好简洁回答");
+    expect(memories[0].score).toBe(0.79);
+  });
+
+  it("fetchProfile 返回画像 dict，空则 null", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ profile: { 偏好: ["简洁回答"] } })),
+    );
+    const profile = await fetchProfile({ apiUrl: "http://b" });
+    expect(profile).toEqual({ 偏好: ["简洁回答"] });
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ profile: null })));
+    expect(await fetchProfile({ apiUrl: "http://b" })).toBeNull();
+  });
+
+  it("revokeFile 发 DELETE", async () => {
+    const fetchMock = vi.fn(async (_url?: string, init?: RequestInit) => jsonResponse({ deleted: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    await revokeFile({ apiUrl: "http://b", module: "chat", fileId: "f1" });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://b/v1/agents/chat/files/f1",
+    );
+    expect((initOf(fetchMock, 0) as RequestInit).method).toBe("DELETE");
+  });
+
+  it("deleteMemory 发 DELETE", async () => {
+    const fetchMock = vi.fn(async (_url?: string, init?: RequestInit) => jsonResponse({ deleted: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    await deleteMemory({ apiUrl: "http://b", memoryId: "m1" });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("http://b/v1/memory/m1");
+    expect((initOf(fetchMock, 0) as RequestInit).method).toBe("DELETE");
+  });
+
+  function initOf(mock: ReturnType<typeof vi.fn>, index: number): unknown {
+    const call = mock.mock.calls[index];
+    return call?.[1];
+  }
 });
