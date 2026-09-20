@@ -114,7 +114,16 @@ export function ThreadList({
 
   const handleDelete = (thread: RecentThread) => {
     if (!window.confirm("确定要删除这条对话吗？此操作无法撤销。")) return;
+    // 正在流式输出的会话先不删：后台流仍会把转写写回本地索引，
+    // 刚删的条目会立刻"复活"，后端线程却已经没了。
+    if (stream.isThreadStreaming(thread.threadId)) {
+      toast.info("对话正在进行中，请先停止再删除", { duration: 5000 });
+      return;
+    }
     setDeletingId(thread.threadId);
+    // 删除的是当前打开的会话 → 主区域一并清空（resetThread 同时清掉
+    // "最后活跃会话"记录，避免下次打开首页试图恢复一条已删除的线程）。
+    if (stream.threadId === thread.threadId) stream.resetThread();
     // 同步删除后端 checkpointer 里的线程：只删本地索引的话，清缓存/
     // 换设备后会"复活"。后端失败不阻塞本地删除（离线也要能整理列表），
     // 但要给出可见的提示；成功后刷新云端列表，避免侧栏残留旧条目。
@@ -127,7 +136,8 @@ export function ThreadList({
       .then(() => setRemoteVersion((v) => v + 1))
       .catch(() => {
         toast.error("云端会话删除失败", {
-          description: "本地已移除，但服务端仍保留这条对话（清缓存后会重新出现）。",
+          description:
+            "本地已移除，但服务端仍保留这条对话（清缓存后会重新出现）。",
           duration: 8000,
           richColors: true,
           closeButton: true,
@@ -247,12 +257,12 @@ export function ThreadList({
                           disabled={deletingId === thread.threadId}
                           title="删除对话"
                         >
-                        {deletingId === thread.threadId ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <Trash2 className="text-muted-foreground hover:text-destructive h-3.5 w-3.5" />
-                        )}
-                      </Button>
+                          {deletingId === thread.threadId ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Trash2 className="text-muted-foreground hover:text-destructive h-3.5 w-3.5" />
+                          )}
+                        </Button>
                       </div>
                     ))}
                   </div>
