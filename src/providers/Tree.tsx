@@ -100,8 +100,11 @@ export function TreeProvider({ children }: { children: ReactNode }) {
     }
   }, [threadId, apiUrl, moduleName]);
 
-  // 会话切换即拉树。
+  // 会话切换即拉树；同时清掉上一会话的"从此分岔"挂起态——挂起节点
+  // 属于旧会话的树，跨会话残留会让下一条消息挂到不存在的节点上
+  //（后端 404 兜底，但体验是莫名的错误提示）。
   useEffect(() => {
+    setBranchHint(null);
     void refresh();
   }, [refresh]);
 
