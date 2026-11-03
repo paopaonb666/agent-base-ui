@@ -106,11 +106,14 @@ export function TreeProvider({ children }: { children: ReactNode }) {
   }, [refresh]);
 
   // 一轮对话收尾（isLoading true→false）后刷新树：回写钩子刚落了新节点。
+  // 后台回写与 done 事件是并发的——立即刷新会抢跑（读到回写前的树），
+  // 短延迟后刷新覆盖常见窗口；手动刷新按钮兜底其余场景。
   useEffect(() => {
     const was = prevLoadingRef.current;
     prevLoadingRef.current = stream.isLoading;
     if (was && !stream.isLoading && threadId) {
-      void refresh();
+      const timer = setTimeout(() => void refresh(), 500);
+      return () => clearTimeout(timer);
     }
   }, [stream.isLoading, threadId, refresh]);
 

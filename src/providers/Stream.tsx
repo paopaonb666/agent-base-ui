@@ -153,6 +153,52 @@ const API_URL_STORAGE_KEY = "agent-base-ui:apiUrl";
 const MODULE_STORAGE_KEY = "agent-base-ui:module";
 const LAST_THREAD_KEY = "agent-base-ui:lastThread";
 
+/**
+ * 把远端历史的树锚点（node_id/label/starred，ADR-013）按**角色序列对齐**
+ * 回填到本地转写。本地转写可能比后端历史"长"（步骤徽标是本地独有的
+ * 视觉条目）——不能按总长度判断：远端每条在本地序列里找同角色（tool
+ * 另须 call_id 一致；本地独有的步骤徽标没有 call_id，被自然跳过）的
+ * 条目，补上锚点。无变化返回 null。
+ */
+function mergeTreeAnchors(
+  local: UiMessage[],
+  remote: UiMessage[],
+): UiMessage[] | null {
+  let changed = false;
+  let li = 0;
+  const merged = local.map((m) => m);
+  for (const r of remote) {
+    if (r.role === "sources") continue;
+    while (
+      li < local.length &&
+      (local[li].role === "sources" ||
+        local[li].role !== r.role ||
+        (r.role === "tool" &&
+          ((local[li] as { call_id?: string }).call_id ?? "") !==
+            (r.call_id ?? "")))
+    ) {
+      li += 1; // 跳过本地独有的条目（步骤徽标 / sources 卡片）
+    }
+    if (li >= local.length) break;
+    const m = local[li];
+    if (m.role === "sources") {
+      li += 1;
+      continue;
+    }
+    if (!m.nodeId && r.nodeId) {
+      merged[li] = {
+        ...m,
+        nodeId: r.nodeId,
+        ...(r.label ? { label: r.label } : {}),
+        ...(r.starred ? { starred: true } : {}),
+      };
+      changed = true;
+    }
+    li += 1;
+  }
+  return changed ? merged : null;
+}
+
 function readStorage(key: string): string | null {
   if (typeof window === "undefined") return null;
   try {
@@ -339,6 +385,26 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         // 半截回复。强制重载（分支切换）例外——后端路径无条件接管。
         if (forced || remote.length > (stored?.length ?? 0)) {
           setTranscript(target, remote);
+          return;
+        }
+        // 不覆盖时的树锚点对账：本地转写（含步骤徽标）回填 node_id 等
+        // 元数据——刷新/切回的会话同样立刻获得树交互（ADR-013）。
+        const base = stored ?? messagesRef.current;
+        if (base.length === 0) return;
+        const merged = mergeTreeAnchors(base, remote);
+        if (merged) {
+          setTranscript(target, merged);
+          const current = getThread(target);
+          if (current) {
+            saveThread({
+              threadId: target,
+              title: current.title,
+              module: current.module,
+              updatedAt: Date.now(),
+              messages: merged,
+              status: current.status ?? "ended",
+            });
+          }
         }
       } catch (err) {
         if (!cancelled && !stored) {
@@ -365,6 +431,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     threadId,
     getThreadMessages,
     getThread,
+    saveThread,
     finalApiUrl,
     finalModule,
     setTranscript,
@@ -466,6 +533,9 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       abortRefs.current.set(turnThreadId, controller);
       let aborted = false;
       let failed = false;
+      // 重新生成（ADR-013）：收尾以远端新活跃路径整体覆盖本地——本地
+      // 转写里还留着被替换出路径的旧回复，对齐合并的语义不适用。
+      const usedRegenerate = regenerate;
       // 后端在流中返回 error 事件：本轮已废，但连接多半还会走到 done，
       // catch 抓不到——单独记号，收口时归入"对话异常"。
       let backendErrored = false;
@@ -589,6 +659,22 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
             threadId: id,
           });
           const remote = replayToUiMessages(history.messages);
+          // 重新生成的轮次：远端就是新的活跃路径，无条件接管本地视图。
+          if (usedRegenerate && transcriptsRef.current.has(id)) {
+            setTranscript(id, remote);
+            const current = getThread(id);
+            if (current) {
+              saveThread({
+                threadId: id,
+                title: current.title,
+                module: current.module,
+                updatedAt: Date.now(),
+                messages: remote,
+                status: current.status ?? "ended",
+              });
+            }
+            return;
+          }
           // 轮次已结束（同线程串行）。只在后端历史比本地更完整时才覆盖：
           // 本地转写带步骤徽标、所见即所得，比它短的后端快照没有理由
           // 抹掉它；比它长说明本地确实缺了内容（唯一要治的漂移）。
@@ -613,35 +699,12 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
             }
             return;
           }
-          // 等长对账（ADR-013）：流式消息本地没有 node_id（后端入树后才
-          // 有）——等长时按位置把 node_id/label/starred 回填到本地条目，
+          // 树锚点对账（ADR-013）：见模块级 mergeTreeAnchors——流式消息
+          // 本地没有 node_id（后端入树后才有），按角色序列对齐回填，
           // 让最新消息立刻获得树交互（分岔/重命名/切换器），不必刷新。
-          if (
-            remote.length === transcript.length &&
-            transcriptsRef.current.has(id)
-          ) {
-            let changed = false;
-            const merged = transcript.map((m, i) => {
-              const r = remote[i];
-              // sources 条目不参与树交互（无 node_id），位置对齐时跳过。
-              if (
-                !r ||
-                r.role !== m.role ||
-                m.role === "sources" ||
-                r.role === "sources"
-              ) {
-                return m;
-              }
-              if (m.nodeId || !r.nodeId) return m;
-              changed = true;
-              return {
-                ...m,
-                nodeId: r.nodeId,
-                ...(r.label ? { label: r.label } : {}),
-                ...(r.starred ? { starred: true } : {}),
-              };
-            });
-            if (changed) {
+          if (transcriptsRef.current.has(id)) {
+            const merged = mergeTreeAnchors(transcript, remote);
+            if (merged) {
               setTranscript(id, merged);
               const current = getThread(id);
               if (current) {
