@@ -3,6 +3,7 @@
 import React from "react";
 import { ThreadProvider } from "@/providers/Thread";
 import { StreamProvider } from "@/providers/Stream";
+import { TreeProvider } from "@/providers/Tree";
 import { AgentChatApp } from "@/components/thread/AgentChatApp";
 import { Toaster } from "@/components/ui/sonner";
 
@@ -18,7 +19,9 @@ export default function HomePage(): React.ReactNode {
       <Toaster />
       <ThreadProvider>
         <StreamProvider>
-          <AgentChatApp />
+          <TreeProvider>
+            <AgentChatApp />
+          </TreeProvider>
         </StreamProvider>
       </ThreadProvider>
     </React.Suspense>

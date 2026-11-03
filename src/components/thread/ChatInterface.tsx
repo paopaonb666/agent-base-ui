@@ -1,13 +1,28 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type DragEvent, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type DragEvent,
+  type FormEvent,
+} from "react";
 import { Button } from "@/components/ui/button";
-import { CircleStop, FileText, Paperclip, SendHorizontal, X } from "lucide-react";
+import {
+  CircleStop,
+  FileText,
+  GitBranch,
+  Paperclip,
+  SendHorizontal,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
 import { ChatMessage } from "./ChatMessage";
 import { FilePreviewDialog, type PreviewTarget } from "./FilePreviewDialog";
 import { uploadDocument, type UploadedFile } from "@/providers/agentBaseClient";
 import { useStreamContext } from "@/providers/Stream";
+import { useTree } from "@/providers/Tree";
 
 // 图片（png/jpg/webp/gif）走多模态通道：vision 模型直接看图。
 const ATTACHMENT_ACCEPT =
@@ -24,6 +39,7 @@ interface PendingUpload {
 
 export function ChatInterface() {
   const stream = useStreamContext();
+  const { branchHint, setBranchHint } = useTree();
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<UploadedFile[]>([]);
   const [pending, setPending] = useState<PendingUpload[]>([]);
@@ -74,7 +90,10 @@ export function ChatInterface() {
     if (!files || uploading) return;
     for (const file of Array.from(files)) {
       const key = `${file.name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      setPending((prev) => [...prev, { key, filename: file.name, progress: 0 }]);
+      setPending((prev) => [
+        ...prev,
+        { key, filename: file.name, progress: 0 },
+      ]);
       try {
         const uploaded = await uploadDocument({
           apiUrl: stream.apiUrl,
@@ -82,12 +101,17 @@ export function ChatInterface() {
           file,
           onProgress: (percent) =>
             setPending((prev) =>
-              prev.map((p) => (p.key === key ? { ...p, progress: percent } : p)),
+              prev.map((p) =>
+                p.key === key ? { ...p, progress: percent } : p,
+              ),
             ),
         });
         if (IMAGE_STORED_FORMATS.has(uploaded.format)) {
           // 图片附件：chip 里显示本地缩略图（revoke 挂在移除时）。
-          setPreviews((prev) => ({ ...prev, [uploaded.file_id]: URL.createObjectURL(file) }));
+          setPreviews((prev) => ({
+            ...prev,
+            [uploaded.file_id]: URL.createObjectURL(file),
+          }));
         }
         setAttachments((prev) => [...prev, uploaded]);
       } catch (err) {
@@ -125,7 +149,8 @@ export function ChatInterface() {
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     const text = input.trim();
-    if ((!text && attachments.length === 0) || isLoading || pending.length > 0) return;
+    if ((!text && attachments.length === 0) || isLoading || pending.length > 0)
+      return;
     const attachmentMeta = attachments.map((a) => ({
       file_id: a.file_id,
       filename: a.filename,
@@ -138,18 +163,33 @@ export function ChatInterface() {
     draftRef.current = text;
     setInput("");
     setAttachments([]);
-    void stream.sendMessage(composed, attachmentMeta).then((result) => {
-      if (!result.ok && !stream.isLoading) {
-        // 发送失败：恢复草稿与附件（若期间用户已输入新内容则不覆盖）。
-        setInput((prev) => (prev ? prev : (result.draft ?? draftRef.current)));
-        setAttachments((prev) => (prev.length > 0 ? prev : attachmentMeta.map((m) => ({
-          ...m,
-          paragraphs: null,
-          truncated: false,
-          warning: null,
-        }))));
-      }
-    });
+    // "从此分岔"（ADR-013）：挂起态在位时，本条消息挂到选定节点之下；
+    // 发送后清除挂起态回到主线模式。
+    const branchOptions = branchHint
+      ? { parentNodeId: branchHint.nodeId }
+      : undefined;
+    const hintNodeId = branchHint?.nodeId;
+    void stream
+      .sendMessage(composed, attachmentMeta, branchOptions)
+      .then((result) => {
+        if (hintNodeId) setBranchHint(null);
+        if (!result.ok && !stream.isLoading) {
+          // 发送失败：恢复草稿与附件（若期间用户已输入新内容则不覆盖）。
+          setInput((prev) =>
+            prev ? prev : (result.draft ?? draftRef.current),
+          );
+          setAttachments((prev) =>
+            prev.length > 0
+              ? prev
+              : attachmentMeta.map((m) => ({
+                  ...m,
+                  paragraphs: null,
+                  truncated: false,
+                  warning: null,
+                })),
+          );
+        }
+      });
   };
 
   return (
@@ -184,6 +224,28 @@ export function ChatInterface() {
       </div>
 
       <div className="border-border bg-background flex-shrink-0 border-t p-4">
+        {branchHint && (
+          <div className="mx-auto mb-3 flex max-w-[900px] items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-800 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-200">
+            <GitBranch
+              className="size-3.5 shrink-0"
+              aria-hidden
+            />
+            <span className="min-w-0 flex-1 truncate">
+              将从「{branchHint.label}」分出新岔路发送
+            </span>
+            <button
+              type="button"
+              className="rounded p-0.5 hover:bg-sky-100 dark:hover:bg-sky-900"
+              onClick={() => setBranchHint(null)}
+              title="取消分岔"
+            >
+              <X
+                className="size-3.5"
+                aria-hidden
+              />
+            </button>
+          </div>
+        )}
         {stream.error && (
           <div className="mx-auto mb-3 max-w-[900px] rounded-lg border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">
             {stream.error}
@@ -198,12 +260,14 @@ export function ChatInterface() {
               >
                 <span className="flex items-center gap-1.5">
                   <FileText className="size-3.5 text-blue-400" />
-                  <span className="max-w-40 truncate font-medium">{p.filename}</span>
+                  <span className="max-w-40 truncate font-medium">
+                    {p.filename}
+                  </span>
                   <span className="text-muted-foreground">{p.progress}%</span>
                 </span>
                 <span className="bg-border h-1 w-full overflow-hidden rounded-full">
                   <span
-                    className="bg-blue-500 block h-full transition-all"
+                    className="block h-full bg-blue-500 transition-all"
                     style={{ width: `${p.progress}%` }}
                   />
                 </span>
@@ -211,10 +275,14 @@ export function ChatInterface() {
             ))}
             {attachments.map((a) => (
               <span
-                className="border-border bg-muted hover:border-blue-300 flex cursor-pointer items-center gap-1.5 rounded-lg border px-2 py-1 text-xs transition-colors"
+                className="border-border bg-muted flex cursor-pointer items-center gap-1.5 rounded-lg border px-2 py-1 text-xs transition-colors hover:border-blue-300"
                 key={a.file_id}
                 onClick={() =>
-                  setPreviewFile({ file_id: a.file_id, filename: a.filename, format: a.format })
+                  setPreviewFile({
+                    file_id: a.file_id,
+                    filename: a.filename,
+                    format: a.format,
+                  })
                 }
                 role="button"
                 title="点击查看文档预览与切片方式"
@@ -228,13 +296,18 @@ export function ChatInterface() {
                 ) : (
                   <FileText className="size-3.5 text-blue-500" />
                 )}
-                <span className="max-w-40 truncate font-medium">{a.filename}</span>
+                <span className="max-w-40 truncate font-medium">
+                  {a.filename}
+                </span>
                 <span className="text-muted-foreground">
                   {a.format}
                   {a.pages ? ` · ${a.pages} 页` : ""} · {a.text_len} 字符
                 </span>
                 {a.warning ? (
-                  <span className="text-amber-600" title={a.warning}>
+                  <span
+                    className="text-amber-600"
+                    title={a.warning}
+                  >
                     ⚠
                   </span>
                 ) : null}
@@ -285,7 +358,9 @@ export function ChatInterface() {
             type="button"
             variant="ghost"
           >
-            <Paperclip className={uploading ? "size-4 animate-pulse" : "size-4"} />
+            <Paperclip
+              className={uploading ? "size-4 animate-pulse" : "size-4"}
+            />
           </Button>
           <textarea
             value={input}
@@ -324,7 +399,10 @@ export function ChatInterface() {
             ) : (
               <Button
                 type="submit"
-                disabled={(!input.trim() && attachments.length === 0) || pending.length > 0}
+                disabled={
+                  (!input.trim() && attachments.length === 0) ||
+                  pending.length > 0
+                }
               >
                 <SendHorizontal className="h-4 w-4" />
                 发送

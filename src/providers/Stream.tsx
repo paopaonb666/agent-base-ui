@@ -33,6 +33,14 @@ export interface SendMessageResult {
   draft: string;
 }
 
+export interface SendMessageOptions {
+  /** 消息树分岔（ADR-013）：新消息挂在哪个节点之下；缺省=当前活跃叶子。 */
+  parentNodeId?: string;
+  /** 重新生成：不追加新 human 气泡，在 parentNodeId（既有 human 节点）
+   * 下重跑一轮——本地转写先截断到该节点，新的 AI 回复作为兄弟分支。 */
+  regenerate?: boolean;
+}
+
 export interface StreamState {
   messages: UiMessage[];
   isLoading: boolean;
@@ -43,9 +51,16 @@ export interface StreamState {
   setApiUrl: (value: string) => void;
   setModule: (value: string) => void;
   setThreadId: (value: string | null) => void;
-  sendMessage: (text: string, attachments?: AttachmentMeta[]) => Promise<SendMessageResult>;
+  sendMessage: (
+    text: string,
+    attachments?: AttachmentMeta[],
+    options?: SendMessageOptions,
+  ) => Promise<SendMessageResult>;
   stop: () => void;
   resetThread: () => void;
+  /** 强制从后端重载当前线程的转写（分支切换后由 Tree 层调用）：
+   *  绕过内存/本地缓存短路，以后端活跃路径为准整体替换。 */
+  reloadThread: () => void;
   /** 该线程是否正在流式对话（按线程追踪，与活跃视图无关）。渲染期调用，
    *  流开始/结束时由 streamingTrigger 触发重算（与 isLoading 同款机制）。 */
   isThreadStreaming: (threadId: string) => boolean;
@@ -65,11 +80,19 @@ function replayToUiMessages(messages: ThreadHistoryMessage[]): UiMessage[] {
   const out: UiMessage[] = [];
   const byCallId = new Map<string, number>();
   messages.forEach((message, index) => {
+    // 消息树锚点（ADR-013）：历史每条带 node_id（+ 可选的标签/星标），
+    // 分岔/跳转/树面板定位都以它为键。
+    const treeMeta = {
+      ...(message.node_id ? { nodeId: message.node_id } : {}),
+      ...(message.label ? { label: message.label } : {}),
+      ...(message.starred ? { starred: true } : {}),
+    };
     if (message.role === "human") {
       out.push({
         id: `h-history-${index}`,
         role: "human",
         content: message.content ?? "",
+        ...treeMeta,
         ...(message.attachments && message.attachments.length > 0
           ? { attachments: message.attachments }
           : {}),
@@ -85,10 +108,16 @@ function replayToUiMessages(messages: ThreadHistoryMessage[]): UiMessage[] {
           role: "tool",
           name: tc.name,
           status: "running", // 若后面的 tool 消息缺失，收尾净化会转成"已中断"
+          ...treeMeta,
           ...(tc.args ? { args: tc.args } : {}),
         });
       }
-      out.push({ id: `a-history-${index}`, role: "assistant", content: message.content ?? "" });
+      out.push({
+        id: `a-history-${index}`,
+        role: "assistant",
+        content: message.content ?? "",
+        ...treeMeta,
+      });
       return;
     }
     // tool 消息：按 tool_call_id 配对补上结果与状态。
@@ -100,6 +129,7 @@ function replayToUiMessages(messages: ThreadHistoryMessage[]): UiMessage[] {
         ...entry,
         status: message.status === "error" ? "error" : "completed",
         result: message.content ?? "",
+        ...(message.node_id ? { nodeId: message.node_id } : {}),
       };
       return;
     }
@@ -109,6 +139,7 @@ function replayToUiMessages(messages: ThreadHistoryMessage[]): UiMessage[] {
       name: message.name ?? "",
       status: message.status === "error" ? "error" : "completed",
       result: message.content ?? "",
+      ...treeMeta,
     });
   });
   return out;
@@ -221,21 +252,29 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     messagesRef.current = messages;
   }, [messages]);
 
-  const setTranscript = useCallback(
-    (id: string, next: UiMessage[]) => {
-      // 刷新插入顺序，配合下方淘汰策略限制内存。
-      transcriptsRef.current.delete(id);
-      transcriptsRef.current.set(id, next);
-      if (transcriptsRef.current.size > 50) {
-        const oldest = transcriptsRef.current.keys().next().value;
-        if (oldest !== undefined && oldest !== id) {
-          transcriptsRef.current.delete(oldest);
-        }
+  // 分支切换后的受控重载（ADR-013）：清掉内存转写 + 强制标记，让线程
+  // 切换 effect 绕过缓存短路，以后端活跃路径为准整体替换视图。
+  const [reloadCounter, setReloadCounter] = useState(0);
+  const forceReloadRef = useRef(false);
+  const reloadThread = useCallback(() => {
+    const id = threadIdRef.current;
+    if (id) transcriptsRef.current.delete(id);
+    forceReloadRef.current = true;
+    setReloadCounter((n) => n + 1);
+  }, []);
+
+  const setTranscript = useCallback((id: string, next: UiMessage[]) => {
+    // 刷新插入顺序，配合下方淘汰策略限制内存。
+    transcriptsRef.current.delete(id);
+    transcriptsRef.current.set(id, next);
+    if (transcriptsRef.current.size > 50) {
+      const oldest = transcriptsRef.current.keys().next().value;
+      if (oldest !== undefined && oldest !== id) {
+        transcriptsRef.current.delete(oldest);
       }
-      if (activeThreadRef.current === id) setMessages(next);
-    },
-    [],
-  );
+    }
+    if (activeThreadRef.current === id) setMessages(next);
+  }, []);
 
   const { saveThread, getThreadMessages, getThread } = useThreads();
 
@@ -266,13 +305,17 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       setMessages([]);
       return;
     }
-    const live = transcriptsRef.current.get(target);
+    // 分支切换的强制重载：绕过内存/本地缓存短路，视图整体让位给后端
+    // 活跃路径（新路径可能比旧缓存短——长度比较不适用）。
+    const forced = forceReloadRef.current;
+    forceReloadRef.current = false;
+    const live = forced ? undefined : transcriptsRef.current.get(target);
     if (live) {
       setMessages(live);
       return;
     }
     // 本地持久化的转写（即时显示），随后后台与后端对账（见下）。
-    const stored = getThreadMessages(target);
+    const stored = forced ? undefined : getThreadMessages(target);
     if (stored) setMessages(stored);
 
     const thread = getThread(target);
@@ -293,8 +336,8 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         const remote = replayToUiMessages(history.messages);
         // 后端是该线程转写的权威来源，但只在"不少于本地"时覆盖：被停止
         // 的轮次后端可能只有更短的历史，不能拿旧快照抹掉用户刚看到的
-        // 半截回复。
-        if (remote.length > (stored?.length ?? 0)) {
+        // 半截回复。强制重载（分支切换）例外——后端路径无条件接管。
+        if (forced || remote.length > (stored?.length ?? 0)) {
           setTranscript(target, remote);
         }
       } catch (err) {
@@ -318,12 +361,25 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     return () => {
       cancelled = true;
     };
-  }, [threadId, getThreadMessages, getThread, finalApiUrl, finalModule, setTranscript]);
+  }, [
+    threadId,
+    getThreadMessages,
+    getThread,
+    finalApiUrl,
+    finalModule,
+    setTranscript,
+    reloadCounter,
+  ]);
 
   const sendMessage = useCallback(
-    async (text: string, attachments?: AttachmentMeta[]): Promise<SendMessageResult> => {
+    async (
+      text: string,
+      attachments?: AttachmentMeta[],
+      options?: SendMessageOptions,
+    ): Promise<SendMessageResult> => {
       if (!finalApiUrl || !finalModule) return { ok: false, draft: text };
-      if (!text.trim()) return { ok: false, draft: text };
+      if (!text.trim() && !options?.regenerate)
+        return { ok: false, draft: text };
 
       const rid = requestId();
       const humanId = `h-${rid}`;
@@ -342,20 +398,36 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
 
       // Seed from the thread's own transcript (live in memory, else what is
       // on screen, else locally persisted) before appending the new turn.
-      const seed =
+      const seedBase =
         transcriptsRef.current.get(turnThreadId) ??
-        (activeThreadRef.current === turnThreadId ? messagesRef.current : undefined) ??
+        (activeThreadRef.current === turnThreadId
+          ? messagesRef.current
+          : undefined) ??
         getThreadMessages(turnThreadId) ??
         [];
-      let transcript: UiMessage[] = [
-        ...seed,
-        {
-          id: humanId,
-          role: "human",
-          content: text.trim(),
-          ...(attachments && attachments.length > 0 ? { attachments } : {}),
-        },
-      ];
+      // 分岔 / 重新生成（ADR-013）：本地转写截断到挂载节点——新消息在树
+      // 上不延续当前可见路径的末端。找不到锚点（本地转写缺 node_id）时
+      // 保守保留全部；收尾对账会以后端权威路径覆盖。
+      const regenerate = options?.regenerate === true;
+      const parentNodeId = options?.parentNodeId;
+      let seed = seedBase;
+      if (parentNodeId) {
+        const at = seed.findIndex(
+          (m) => ("nodeId" in m ? m.nodeId : undefined) === parentNodeId,
+        );
+        if (at >= 0) seed = seed.slice(0, at + 1);
+      }
+      let transcript: UiMessage[] = regenerate
+        ? [...seed]
+        : [
+            ...seed,
+            {
+              id: humanId,
+              role: "human",
+              content: text.trim(),
+              ...(attachments && attachments.length > 0 ? { attachments } : {}),
+            } satisfies UiMessage,
+          ];
       setTranscript(turnThreadId, transcript);
       setError(null);
       updateThreadId(turnThreadId);
@@ -403,6 +475,8 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           module: turnModule,
           message: text.trim(),
           threadId: turnThreadId,
+          ...(parentNodeId ? { parentNodeNodeId: parentNodeId } : {}),
+          ...(regenerate ? { regenerate: true } : {}),
           attachments: attachments?.map((a) => a.file_id),
           requestId: rid,
           signal: controller.signal,
@@ -537,6 +611,50 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
                 status: current.status ?? "ended",
               });
             }
+            return;
+          }
+          // 等长对账（ADR-013）：流式消息本地没有 node_id（后端入树后才
+          // 有）——等长时按位置把 node_id/label/starred 回填到本地条目，
+          // 让最新消息立刻获得树交互（分岔/重命名/切换器），不必刷新。
+          if (
+            remote.length === transcript.length &&
+            transcriptsRef.current.has(id)
+          ) {
+            let changed = false;
+            const merged = transcript.map((m, i) => {
+              const r = remote[i];
+              // sources 条目不参与树交互（无 node_id），位置对齐时跳过。
+              if (
+                !r ||
+                r.role !== m.role ||
+                m.role === "sources" ||
+                r.role === "sources"
+              ) {
+                return m;
+              }
+              if (m.nodeId || !r.nodeId) return m;
+              changed = true;
+              return {
+                ...m,
+                nodeId: r.nodeId,
+                ...(r.label ? { label: r.label } : {}),
+                ...(r.starred ? { starred: true } : {}),
+              };
+            });
+            if (changed) {
+              setTranscript(id, merged);
+              const current = getThread(id);
+              if (current) {
+                saveThread({
+                  threadId: id,
+                  title: current.title,
+                  module: current.module,
+                  updatedAt: Date.now(),
+                  messages: merged,
+                  status: current.status ?? "ended",
+                });
+              }
+            }
           }
         } catch {
           // 对账失败不打扰用户：本地转写已经是完整所见即所得。
@@ -630,7 +748,9 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
                     ...m,
                     status: status as "completed" | "error",
                     ...(event.result ? { result: event.result } : {}),
-                    ...(event.duration_ms !== null ? { duration_ms: event.duration_ms } : {}),
+                    ...(event.duration_ms !== null
+                      ? { duration_ms: event.duration_ms }
+                      : {}),
                     ...(event.error ? { error: event.error } : {}),
                   }
                 : m,
@@ -646,7 +766,10 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
                 role: "sources" as const,
                 sources: event.sources
                   .filter((s) => s.title)
-                  .map((s) => ({ title: s.title, ...(s.url ? { url: s.url } : {}) })),
+                  .map((s) => ({
+                    title: s.title,
+                    ...(s.url ? { url: s.url } : {}),
+                  })),
               },
             ];
           }
@@ -750,6 +873,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     sendMessage,
     stop,
     resetThread,
+    reloadThread,
     isThreadStreaming,
   };
 

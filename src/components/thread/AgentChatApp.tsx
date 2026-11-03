@@ -3,10 +3,17 @@
 import { useState } from "react";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
-import { BookOpen, MessagesSquare, Settings, SquarePen } from "lucide-react";
+import {
+  BookOpen,
+  GitBranch,
+  MessagesSquare,
+  Settings,
+  SquarePen,
+} from "lucide-react";
 import { ThreadList } from "./ThreadList";
 import { ChatInterface } from "./ChatInterface";
 import { ConfigDialog } from "./ConfigDialog";
+import { MessageTreePanel } from "./MessageTreePanel";
 import { ThreadStatusBadge } from "./ThreadStatusBadge";
 import { useStreamContext } from "@/providers/Stream";
 import { useThreads } from "@/providers/Thread";
@@ -16,6 +23,7 @@ export function AgentChatApp() {
   const stream = useStreamContext();
   const { threads } = useThreads();
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [treeOpen, setTreeOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
 
   const openThread = ({
@@ -59,9 +67,24 @@ export function AgentChatApp() {
               <MessagesSquare className="mr-2 h-4 w-4" />
               对话列表
             </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setTreeOpen((v) => !v)}
+              disabled={!stream.threadId}
+              className={treeOpen ? "bg-accent rounded-md" : "rounded-md"}
+              title="消息树"
+            >
+              <GitBranch className="mr-2 h-4 w-4" />
+              消息树
+            </Button>
           </div>
           <div className="flex items-center gap-2">
-            <Button asChild variant="outline" size="sm">
+            <Button
+              asChild
+              variant="outline"
+              size="sm"
+            >
               <Link href="/knowledge">
                 <BookOpen className="mr-2 h-4 w-4" />
                 知识库
@@ -100,6 +123,11 @@ export function AgentChatApp() {
           <main className="flex flex-1 flex-col overflow-hidden">
             <ChatInterface />
           </main>
+          {treeOpen && stream.threadId && (
+            <aside className="border-border bg-sidebar w-[300px] shrink-0 border-l">
+              <MessageTreePanel />
+            </aside>
+          )}
         </div>
       </div>
 

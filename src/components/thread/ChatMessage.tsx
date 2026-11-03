@@ -5,6 +5,7 @@ import { FileText } from "lucide-react";
 import { ExternalLink } from "lucide-react";
 import { UiMessage } from "@/providers/Stream";
 import { MarkdownText } from "./markdown-text";
+import { MessageActionsMenu } from "./message-tree-actions";
 import { ToolStep } from "./messages/tool-calls";
 import { useSmoothText } from "./use-smooth-text";
 
@@ -43,7 +44,11 @@ export const ChatMessage = memo(function ChatMessage({
   message: UiMessage;
   isStreaming?: boolean;
   /** 点击附件 chip 打开文档预览与切片可视化（M7）。 */
-  onOpenFile?: (file: { file_id: string; filename: string; format: string }) => void;
+  onOpenFile?: (file: {
+    file_id: string;
+    filename: string;
+    format: string;
+  }) => void;
 }) {
   if (message.role === "tool") {
     return (
@@ -101,49 +106,74 @@ export const ChatMessage = memo(function ChatMessage({
 
   if (message.role === "human") {
     return (
-      <div className="flex w-full justify-end">
-        <div
-          className="border-border text-foreground max-w-[70%] overflow-hidden rounded-2xl rounded-br-sm border px-3 py-2 text-sm leading-relaxed break-words"
-          style={{ backgroundColor: "var(--color-user-message-bg)" }}
-        >
-          {message.attachments?.length ? (
-            <div className="mb-2 flex flex-wrap justify-end gap-1.5">
-              {message.attachments.map((a) => (
-                <button
-                  className="border-border bg-background hover:border-blue-300 flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs transition-colors"
-                  key={a.file_id}
-                  onClick={() =>
-                    onOpenFile?.({
-                      file_id: a.file_id,
-                      filename: a.filename,
-                      format: a.format,
-                    })
-                  }
-                  title="点击查看文档预览与切片方式"
-                  type="button"
-                >
-                  <FileText className="size-3 text-blue-500" />
-                  <span className="max-w-40 truncate">{a.filename}</span>
-                  <span className="text-muted-foreground">
-                    {a.format}
-                    {a.pages ? ` · ${a.pages} 页` : ""} · {a.text_len} 字符
-                  </span>
-                </button>
-              ))}
+      <div className="group flex w-full flex-col items-end">
+        <div className="flex w-full items-start justify-end gap-1">
+          <div className="order-1 flex max-w-[70%] flex-col items-end">
+            <div
+              className="border-border text-foreground overflow-hidden rounded-2xl rounded-br-sm border px-3 py-2 text-sm leading-relaxed break-words"
+              style={{ backgroundColor: "var(--color-user-message-bg)" }}
+            >
+              {message.attachments?.length ? (
+                <div className="mb-2 flex flex-wrap justify-end gap-1.5">
+                  {message.attachments.map((a) => (
+                    <button
+                      className="border-border bg-background flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-0.5 text-xs transition-colors hover:border-blue-300"
+                      key={a.file_id}
+                      onClick={() =>
+                        onOpenFile?.({
+                          file_id: a.file_id,
+                          filename: a.filename,
+                          format: a.format,
+                        })
+                      }
+                      title="点击查看文档预览与切片方式"
+                      type="button"
+                    >
+                      <FileText className="size-3 text-blue-500" />
+                      <span className="max-w-40 truncate">{a.filename}</span>
+                      <span className="text-muted-foreground">
+                        {a.format}
+                        {a.pages ? ` · ${a.pages} 页` : ""} · {a.text_len} 字符
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              <p className="m-0 break-words whitespace-pre-wrap">
+                {message.content}
+              </p>
             </div>
-          ) : null}
-          <p className="m-0 break-words whitespace-pre-wrap">
-            {message.content}
-          </p>
+          </div>
+          {/* 消息树操作（ADR-013）：历史消息（有 node_id）hover 显示 */}
+          {message.nodeId && !isStreaming && (
+            <div className="order-2 mt-1">
+              <MessageActionsMenu
+                nodeId={message.nodeId}
+                role="human"
+                content={message.content}
+                className="flex-row-reverse"
+              />
+            </div>
+          )}
         </div>
       </div>
     );
   }
 
   return (
-    <AssistantMessage
-      content={message.content}
-      isStreaming={isStreaming}
-    />
+    <div className="group w-full">
+      <AssistantMessage
+        content={message.content}
+        isStreaming={isStreaming}
+      />
+      {/* 消息树操作（ADR-013）：分支切换器 ‹1/2› + hover 菜单 */}
+      {message.nodeId && !isStreaming && (
+        <MessageActionsMenu
+          nodeId={message.nodeId}
+          role="assistant"
+          content={message.content}
+        />
+      )}
+    </div>
   );
 });

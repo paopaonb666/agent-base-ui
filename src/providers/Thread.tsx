@@ -43,10 +43,25 @@ export interface SourceRef {
   url?: string;
 }
 
+// 消息树锚点（ADR-013）：历史消息携带的节点 id 与维护元数据——分岔 /
+// 跳转 / 树面板定位都靠它。流式新建的消息在收尾对账时由后端历史回填。
+export interface MessageTreeMeta {
+  nodeId?: string;
+  /** 用户给节点起的标签（分支命名）。 */
+  label?: string;
+  /** 星标（重要节点）。 */
+  starred?: boolean;
+}
+
 export type ThreadMessage =
-  | { id: string; role: "human"; content: string; attachments?: AttachmentMeta[] }
-  | { id: string; role: "assistant"; content: string }
-  | {
+  | ({
+      id: string;
+      role: "human";
+      content: string;
+      attachments?: AttachmentMeta[];
+    } & MessageTreeMeta)
+  | ({ id: string; role: "assistant"; content: string } & MessageTreeMeta)
+  | ({
       id: string;
       role: "tool";
       name: string;
@@ -58,7 +73,7 @@ export type ThreadMessage =
       args?: Record<string, unknown>;
       duration_ms?: number;
       error?: string;
-    }
+    } & MessageTreeMeta)
   | { id: string; role: "sources"; sources: SourceRef[] };
 
 // 会话级状态（参考 chat-agent 的步骤/工具状态色板，提升到会话维度）：
@@ -131,6 +146,11 @@ function sanitizeMessages(messages: unknown): ThreadMessage[] {
         id,
         role,
         content: m.content,
+        ...(typeof m.nodeId === "string" && m.nodeId
+          ? { nodeId: m.nodeId }
+          : {}),
+        ...(typeof m.label === "string" && m.label ? { label: m.label } : {}),
+        ...(m.starred === true ? { starred: true } : {}),
         ...(role === "human" && Array.isArray(rawAtts)
           ? {
               attachments: (rawAtts as Record<string, unknown>[])
@@ -161,17 +181,26 @@ function sanitizeMessages(messages: unknown): ThreadMessage[] {
         name: typeof m.name === "string" ? m.name : "",
         // "running" 不可能属于已结束的会话——页面刷新即流中断。
         status,
+        ...(typeof m.nodeId === "string" && m.nodeId
+          ? { nodeId: m.nodeId }
+          : {}),
         ...(typeof m.detail === "string" && m.detail
           ? { detail: m.detail }
           : status === "error" && m.status === "running"
             ? { detail: "已中断（页面刷新或关闭）" }
             : {}),
-        ...(typeof m.result === "string" && m.result ? { result: m.result } : {}),
-        ...(typeof m.call_id === "string" && m.call_id ? { call_id: m.call_id } : {}),
+        ...(typeof m.result === "string" && m.result
+          ? { result: m.result }
+          : {}),
+        ...(typeof m.call_id === "string" && m.call_id
+          ? { call_id: m.call_id }
+          : {}),
         ...(typeof rawArgs === "object" && rawArgs !== null
           ? { args: rawArgs as Record<string, unknown> }
           : {}),
-        ...(typeof m.duration_ms === "number" ? { duration_ms: m.duration_ms } : {}),
+        ...(typeof m.duration_ms === "number"
+          ? { duration_ms: m.duration_ms }
+          : {}),
         ...(typeof m.error === "string" && m.error ? { error: m.error } : {}),
       });
     } else if (role === "sources") {

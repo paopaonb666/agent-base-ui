@@ -14,6 +14,12 @@ import {
   fetchMemories,
   fetchProfile,
   fetchThreadHistory,
+  fetchThreadTree,
+  patchTreeNode,
+  deleteTreeNode,
+  restoreTreeNode,
+  jumpThreadBranch,
+  exportThreadTree,
   invokeAgent,
   listKnowledgeFiles,
   listModules,
@@ -210,7 +216,9 @@ describe("fetchThreadHistory / fetchHealth / listModules", () => {
   });
 
   it("deleteThread 调用 DELETE 端点且成功时不抛错", async () => {
-    const fetchMock = vi.fn(async (_url: unknown) => jsonResponse({ deleted: true }));
+    const fetchMock = vi.fn(async (_url: unknown) =>
+      jsonResponse({ deleted: true }),
+    );
     vi.stubGlobal("fetch", fetchMock);
     await expect(
       deleteThread({ apiUrl: "http://b", module: "chat", threadId: "t1" }),
@@ -329,7 +337,9 @@ describe("文档预览与切片可视化（M7）", () => {
     const createSpy = vi
       .spyOn(URL, "createObjectURL")
       .mockImplementation(() => "blob:mock-object-url");
-    const revokeSpy = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    const revokeSpy = vi
+      .spyOn(URL, "revokeObjectURL")
+      .mockImplementation(() => {});
     const url = await fetchFileRawObjectUrl({
       apiUrl: "http://b",
       module: "chat",
@@ -366,8 +376,13 @@ describe("知识库页面与长期记忆（M8）", () => {
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    const files = await listKnowledgeFiles({ apiUrl: "http://b", userId: "default" });
-    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("http://b/v1/knowledge/files");
+    const files = await listKnowledgeFiles({
+      apiUrl: "http://b",
+      userId: "default",
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://b/v1/knowledge/files",
+    );
     expect(files).toHaveLength(1);
     expect(files[0].chunks).toBe(3);
   });
@@ -415,12 +430,17 @@ describe("知识库页面与长期记忆（M8）", () => {
     );
     const profile = await fetchProfile({ apiUrl: "http://b" });
     expect(profile).toEqual({ 偏好: ["简洁回答"] });
-    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse({ profile: null })));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ profile: null })),
+    );
     expect(await fetchProfile({ apiUrl: "http://b" })).toBeNull();
   });
 
   it("revokeFile 发 DELETE", async () => {
-    const fetchMock = vi.fn(async (_url?: string, init?: RequestInit) => jsonResponse({ deleted: true }));
+    const fetchMock = vi.fn(async (_url?: string, init?: RequestInit) =>
+      jsonResponse({ deleted: true }),
+    );
     vi.stubGlobal("fetch", fetchMock);
     await revokeFile({ apiUrl: "http://b", module: "chat", fileId: "f1" });
     expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
@@ -430,7 +450,9 @@ describe("知识库页面与长期记忆（M8）", () => {
   });
 
   it("deleteMemory 发 DELETE", async () => {
-    const fetchMock = vi.fn(async (_url?: string, init?: RequestInit) => jsonResponse({ deleted: true }));
+    const fetchMock = vi.fn(async (_url?: string, init?: RequestInit) =>
+      jsonResponse({ deleted: true }),
+    );
     vi.stubGlobal("fetch", fetchMock);
     await deleteMemory({ apiUrl: "http://b", memoryId: "m1" });
     expect(String(fetchMock.mock.calls[0]?.[0])).toBe("http://b/v1/memory/m1");
@@ -441,4 +463,204 @@ describe("知识库页面与长期记忆（M8）", () => {
     const call = mock.mock.calls[index];
     return call?.[1];
   }
+});
+
+// ───────────────────────── 消息树 API（ADR-013） ─────────────────────────
+
+describe("message tree API", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function initOf(mock: ReturnType<typeof vi.fn>, index: number): RequestInit {
+    return mock.mock.calls[index]?.[1] as RequestInit;
+  }
+
+  it("fetchThreadTree 请求 tree 端点", async () => {
+    const tree = {
+      thread_id: "t1",
+      module: "chat",
+      current_node_id: "n2",
+      nodes: [
+        {
+          node_id: "n1",
+          parent_id: null,
+          role: "human",
+          seq: 1,
+          label: "",
+          starred: false,
+          archived: false,
+          created_at: 1,
+          deleted: false,
+          preview: "你好",
+        },
+        {
+          node_id: "n2",
+          parent_id: "n1",
+          role: "assistant",
+          seq: 2,
+          label: "",
+          starred: true,
+          archived: false,
+          created_at: 2,
+          deleted: false,
+          preview: "回答",
+        },
+      ],
+    };
+    const fetchMock = vi.fn(async (_url?: string, _init?: RequestInit) =>
+      jsonResponse(tree),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await fetchThreadTree({
+      apiUrl: "http://b",
+      module: "chat",
+      threadId: "t1",
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://b/v1/agents/chat/threads/t1/tree",
+    );
+    expect(result.current_node_id).toBe("n2");
+    expect(result.nodes).toHaveLength(2);
+  });
+
+  it("fetchThreadTree 的 withContent 附加查询参数", async () => {
+    const fetchMock = vi.fn(async (_url?: string, _init?: RequestInit) =>
+      jsonResponse({
+        thread_id: "t1",
+        module: "chat",
+        current_node_id: null,
+        nodes: [],
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await fetchThreadTree({
+      apiUrl: "http://b",
+      module: "chat",
+      threadId: "t1",
+      withContent: true,
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("with_content=true");
+  });
+
+  it("patchTreeNode 发 PATCH + JSON 体", async () => {
+    const fetchMock = vi.fn(async (_url?: string, _init?: RequestInit) =>
+      jsonResponse({ node: { node_id: "n1", starred: true } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const node = await patchTreeNode({
+      apiUrl: "http://b",
+      module: "chat",
+      threadId: "t1",
+      nodeId: "n1",
+      label: "起点",
+      starred: true,
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/nodes/n1");
+    expect(initOf(fetchMock, 0).method).toBe("PATCH");
+    expect(JSON.parse(String(initOf(fetchMock, 0).body))).toEqual({
+      label: "起点",
+      starred: true,
+    });
+    expect(node.starred).toBe(true);
+  });
+
+  it("deleteTreeNode 的 cascade 查询参数", async () => {
+    const fetchMock = vi.fn(async (_url?: string, _init?: RequestInit) =>
+      jsonResponse({ deleted: 3, pointer_rolled_back: true }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await deleteTreeNode({
+      apiUrl: "http",
+      module: "chat",
+      threadId: "t1",
+      nodeId: "n1",
+      cascade: true,
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("cascade=true");
+    expect(initOf(fetchMock, 0).method).toBe("DELETE");
+    expect(result.deleted).toBe(3);
+  });
+
+  it("restoreTreeNode 发 POST", async () => {
+    const fetchMock = vi.fn(async (_url?: string, _init?: RequestInit) =>
+      jsonResponse({ restored: 2 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await restoreTreeNode({
+      apiUrl: "http://b",
+      module: "chat",
+      threadId: "t1",
+      nodeId: "n1",
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/nodes/n1/restore");
+    expect(initOf(fetchMock, 0).method).toBe("POST");
+    expect(result.restored).toBe(2);
+  });
+
+  it("jumpThreadBranch 发 POST + node_id 体", async () => {
+    const fetchMock = vi.fn(async (_url?: string, _init?: RequestInit) =>
+      jsonResponse({ thread_id: "t1", current_node_id: "n5" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await jumpThreadBranch({
+      apiUrl: "http://b",
+      module: "chat",
+      threadId: "t1",
+      nodeId: "n5",
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("/jump");
+    expect(JSON.parse(String(initOf(fetchMock, 0).body))).toEqual({
+      node_id: "n5",
+    });
+    expect(result.current_node_id).toBe("n5");
+  });
+
+  it("exportThreadTree 返回 md 文本；json 返回序列化字符串", async () => {
+    const fetchMock = vi.fn(async (_url?: string, _init?: RequestInit) =>
+      jsonResponse({ content: "# 标题" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const md = await exportThreadTree({
+      apiUrl: "http://b",
+      module: "chat",
+      threadId: "t1",
+      format: "md",
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain("format=md");
+    expect(md).toBe("# 标题");
+    const fetchMock2 = vi.fn(async (_url?: string, _init?: RequestInit) =>
+      jsonResponse({ nodes: [1, 2] }),
+    );
+    vi.stubGlobal("fetch", fetchMock2);
+    const json = await exportThreadTree({
+      apiUrl: "http://b",
+      module: "chat",
+      threadId: "t1",
+      format: "json",
+    });
+    expect(json).toContain('"nodes"');
+  });
+
+  it("invokeAgent 携带分岔与重新生成参数", async () => {
+    const fetchMock = vi.fn(async (_url?: string, init?: RequestInit) =>
+      sseResponse(['event: done\ndata: {"type":"done","thread_id":"t1"}\n\n']),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const events: unknown[] = [];
+    for await (const event of invokeAgent({
+      apiUrl: "http://b",
+      module: "chat",
+      message: "x",
+      threadId: "t1",
+      parentNodeNodeId: "n9",
+      regenerate: true,
+    })) {
+      events.push(event);
+    }
+    const body = JSON.parse(String(initOf(fetchMock, 0).body));
+    expect(body.parent_node_id).toBe("n9");
+    expect(body.regenerate).toBe(true);
+    expect(events.at(-1)).toEqual({ type: "done", thread_id: "t1" });
+  });
 });

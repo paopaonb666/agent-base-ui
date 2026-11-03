@@ -49,6 +49,10 @@ export interface InvokeAgentArgs {
   module: string;
   message: string;
   threadId?: string | null;
+  /** 消息树分岔（ADR-013）：新消息挂在哪个节点之下；缺省=当前活跃叶子。 */
+  parentNodeNodeId?: string | null;
+  /** 重新生成：不追加新 human，在 parentNodeNodeId（既有 human 节点）下重跑。 */
+  regenerate?: boolean;
   /** 附件对话（M4b）：本条消息引用的上传文件 id。 */
   attachments?: string[];
   requestId?: string;
@@ -74,6 +78,12 @@ export interface ThreadHistoryMessage {
   role: "human" | "assistant" | "tool";
   content?: string;
   name?: string;
+  /** 消息树节点 id（ADR-013）：前端树交互的锚点。 */
+  node_id?: string;
+  /** 节点标签（用户重命名的分支名；仅打了标签的消息带）。 */
+  label?: string;
+  /** 节点星标（仅星标过的消息带）。 */
+  starred?: boolean;
   /** 仅 human：本条消息引用的上传附件元数据。 */
   attachments?: ThreadHistoryAttachment[];
   /** 仅 assistant：本条消息发起的工具调用（调用参数在此）。 */
@@ -131,7 +141,10 @@ export function uploadDocument(args: {
         return;
       }
       const body = xhr.response as { detail?: unknown } | null;
-      const detail = typeof body?.detail === "string" ? body.detail : `上传失败（${xhr.status}）`;
+      const detail =
+        typeof body?.detail === "string"
+          ? body.detail
+          : `上传失败（${xhr.status}）`;
       reject(new Error(detail));
     };
     xhr.onerror = () => reject(new Error("网络错误，上传失败"));
@@ -273,6 +286,150 @@ export async function deleteThread(args: {
   if (!response.ok) throw new Error(await extractErrorDetail(response));
 }
 
+// ───────────────────────── 消息树（ADR-013） ─────────────────────────
+
+/** 树 API 返回的一个节点（元数据形态；content 只在 withContent 时带）。 */
+export interface TreeNode {
+  node_id: string;
+  parent_id: string | null;
+  role: "human" | "assistant" | "tool";
+  seq: number;
+  label: string;
+  starred: boolean;
+  archived: boolean;
+  created_at: number;
+  deleted: boolean;
+  /** withContent=false 时的 80 字内容预览。 */
+  preview?: string;
+  /** withContent=true 时的全文。 */
+  content?: string;
+  tool_call_id?: string;
+  status?: "ok" | "error";
+  attachments?: ThreadHistoryAttachment[];
+  tool_calls?: ThreadHistoryToolCall[];
+}
+
+/** GET /threads/{id}/tree 的返回：整棵树 + 活跃指针。 */
+export interface ThreadTree {
+  thread_id: string;
+  module: string;
+  current_node_id: string | null;
+  nodes: TreeNode[];
+}
+
+/** 拉取整棵消息树（侧边树面板的数据源；默认只带预览）。 */
+export async function fetchThreadTree(args: {
+  apiUrl: string;
+  module: string;
+  threadId: string;
+  withContent?: boolean;
+  signal?: AbortSignal;
+}): Promise<ThreadTree> {
+  const base = `${args.apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(args.module)}/threads/${encodeURIComponent(args.threadId)}/tree`;
+  const url = args.withContent ? `${base}?with_content=true` : base;
+  const response = await fetch(url, { signal: args.signal });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  return (await response.json()) as ThreadTree;
+}
+
+/** 维护节点元数据：重命名标签 / 星标 / 归档（null = 不修改）。 */
+export async function patchTreeNode(args: {
+  apiUrl: string;
+  module: string;
+  threadId: string;
+  nodeId: string;
+  label?: string | null;
+  starred?: boolean | null;
+  archived?: boolean | null;
+  signal?: AbortSignal;
+}): Promise<TreeNode> {
+  const url = `${args.apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(args.module)}/threads/${encodeURIComponent(args.threadId)}/nodes/${encodeURIComponent(args.nodeId)}`;
+  const body: Record<string, unknown> = {};
+  if (args.label !== undefined) body.label = args.label;
+  if (args.starred !== undefined) body.starred = args.starred;
+  if (args.archived !== undefined) body.archived = args.archived;
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: args.signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  return ((await response.json()) as { node: TreeNode }).node;
+}
+
+/** 软删一棵子树（默认仅叶子；cascade=true 连后代一起，可恢复）。 */
+export async function deleteTreeNode(args: {
+  apiUrl: string;
+  module: string;
+  threadId: string;
+  nodeId: string;
+  cascade?: boolean;
+  signal?: AbortSignal;
+}): Promise<{ deleted: number; pointer_rolled_back: boolean }> {
+  const base = `${args.apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(args.module)}/threads/${encodeURIComponent(args.threadId)}/nodes/${encodeURIComponent(args.nodeId)}`;
+  const url = args.cascade ? `${base}?cascade=true` : base;
+  const response = await fetch(url, { method: "DELETE", signal: args.signal });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  return (await response.json()) as {
+    deleted: number;
+    pointer_rolled_back: boolean;
+  };
+}
+
+/** 恢复一棵软删的子树（连同其全部软删后代）。 */
+export async function restoreTreeNode(args: {
+  apiUrl: string;
+  module: string;
+  threadId: string;
+  nodeId: string;
+  signal?: AbortSignal;
+}): Promise<{ restored: number }> {
+  const url = `${args.apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(args.module)}/threads/${encodeURIComponent(args.threadId)}/nodes/${encodeURIComponent(args.nodeId)}/restore`;
+  const response = await fetch(url, { method: "POST", signal: args.signal });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  return (await response.json()) as { restored: number };
+}
+
+/** 切换活跃分支（懒物化：下次 invoke 前后端才重写执行缓存）。 */
+export async function jumpThreadBranch(args: {
+  apiUrl: string;
+  module: string;
+  threadId: string;
+  nodeId: string;
+  signal?: AbortSignal;
+}): Promise<{ thread_id: string; current_node_id: string }> {
+  const url = `${args.apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(args.module)}/threads/${encodeURIComponent(args.threadId)}/jump`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: args.nodeId }),
+    signal: args.signal,
+  });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  return (await response.json()) as {
+    thread_id: string;
+    current_node_id: string;
+  };
+}
+
+/** 导出整棵消息树：Markdown 文本或 JSON 结构。 */
+export async function exportThreadTree(args: {
+  apiUrl: string;
+  module: string;
+  threadId: string;
+  format: "md" | "json";
+  signal?: AbortSignal;
+}): Promise<string> {
+  const url = `${args.apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(args.module)}/threads/${encodeURIComponent(args.threadId)}/export?format=${args.format}`;
+  const response = await fetch(url, { signal: args.signal });
+  if (!response.ok) throw new Error(await extractErrorDetail(response));
+  const body = (await response.json()) as { content?: string };
+  if (args.format === "md")
+    return typeof body.content === "string" ? body.content : "";
+  return JSON.stringify(body, null, 2);
+}
+
 /** Parse one SSE frame ("event: x\ndata: {...}") into a typed event.
  * Exported for unit tests; treat as internal API. */
 export function parseFrame(frame: string): AgentBaseEvent | null {
@@ -310,7 +467,9 @@ export function parseFrame(frame: string): AgentBaseEvent | null {
       const sources: AgentBaseSource[] = raw
         .filter(
           (s: unknown): s is Record<string, unknown> =>
-            typeof s === "object" && s !== null && typeof (s as Record<string, unknown>).title === "string",
+            typeof s === "object" &&
+            s !== null &&
+            typeof (s as Record<string, unknown>).title === "string",
         )
         .map((s: Record<string, unknown>) => ({
           title: String(s.title),
@@ -322,10 +481,14 @@ export function parseFrame(frame: string): AgentBaseEvent | null {
       // 工具调用记录（M5）：start 带 args，end 带 result/status/duration。
       const rawArgs: unknown = data.args;
       const args: Record<string, unknown> =
-        typeof rawArgs === "object" && rawArgs !== null ? (rawArgs as Record<string, unknown>) : {};
+        typeof rawArgs === "object" && rawArgs !== null
+          ? (rawArgs as Record<string, unknown>)
+          : {};
       const phase = data.phase === "end" ? "end" : "start";
       const status =
-        data.status === "ok" || data.status === "timeout" || data.status === "error"
+        data.status === "ok" ||
+        data.status === "timeout" ||
+        data.status === "error"
           ? data.status
           : null;
       return {
@@ -336,7 +499,8 @@ export function parseFrame(frame: string): AgentBaseEvent | null {
         args,
         result: typeof data.result === "string" ? data.result : null,
         status,
-        duration_ms: typeof data.duration_ms === "number" ? data.duration_ms : null,
+        duration_ms:
+          typeof data.duration_ms === "number" ? data.duration_ms : null,
         error: typeof data.error === "string" ? data.error : null,
       };
     }
@@ -372,6 +536,8 @@ export async function* invokeAgent(
     module,
     message,
     threadId,
+    parentNodeNodeId,
+    regenerate,
     attachments,
     requestId: rid = requestId(),
     signal,
@@ -386,6 +552,8 @@ export async function* invokeAgent(
     body: JSON.stringify({
       message,
       ...(threadId ? { thread_id: threadId } : {}),
+      ...(parentNodeNodeId ? { parent_node_id: parentNodeNodeId } : {}),
+      ...(regenerate ? { regenerate: true } : {}),
       ...(attachments && attachments.length > 0 ? { attachments } : {}),
     }),
     signal,
@@ -722,8 +890,8 @@ export async function fetchProfile(args: {
   if (!response.ok) throw new Error(await extractErrorDetail(response));
   const body = (await response.json()) as { profile?: unknown };
   if (typeof body.profile !== "object" || body.profile === null) return null;
-  const entries = Object.entries(body.profile as Record<string, unknown>).filter(
-    (pair): pair is [string, string[]] => Array.isArray(pair[1]),
-  );
+  const entries = Object.entries(
+    body.profile as Record<string, unknown>,
+  ).filter((pair): pair is [string, string[]] => Array.isArray(pair[1]));
   return Object.fromEntries(entries);
 }
