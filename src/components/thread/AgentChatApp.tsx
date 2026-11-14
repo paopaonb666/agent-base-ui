@@ -81,6 +81,9 @@ export function AgentChatApp() {
                 消息树
               </Button>
             )}
+            {/* 新建对话恒可点（GUI 验收缺陷 4）：语义=视图重置到白纸——
+                旧实现 disabled={!stream.threadId} 让模块切换后（threadId 被
+                重置）与首次使用者（无线程）面对死按钮。 */}
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -105,7 +108,6 @@ export function AgentChatApp() {
               variant="outline"
               size="sm"
               onClick={() => stream.resetThread()}
-              disabled={!stream.threadId}
             >
               <SquarePen className="mr-2 h-4 w-4" />
               新建对话
