@@ -4,6 +4,8 @@ import { memo } from "react";
 import { FileText } from "lucide-react";
 import { ExternalLink } from "lucide-react";
 import { UiMessage } from "@/providers/Stream";
+import { cn } from "@/lib/utils";
+import { MESSAGE_TREE_ENABLED } from "@/lib/feature-flags";
 import { MarkdownText } from "./markdown-text";
 import { MessageActionsMenu } from "./message-tree-actions";
 import { ToolStep } from "./messages/tool-calls";
@@ -104,6 +106,57 @@ export const ChatMessage = memo(function ChatMessage({
     );
   }
 
+  if (message.role === "plan") {
+    // planner plan 事件卡（#96 planner 任务分解可视化）：每次事件整表
+    // 替换，渲染最新任务表。status 图标语义：done/failed=终态着色，
+    // pending/running=进行中。
+    const statusLabel: Record<string, string> = {
+      created: "已创建",
+      progress: "进行中",
+      replanned: "已重规划",
+      done: "已完结",
+    };
+    const taskIcon: Record<string, { cls: string; label: string }> = {
+      done: { cls: "text-green-500", label: "✓" },
+      failed: { cls: "text-rose-500", label: "✕" },
+      running: { cls: "text-blue-500", label: "▸" },
+      pending: { cls: "text-gray-400", label: "○" },
+    };
+    return (
+      <div className="mx-auto grid w-full max-w-3xl gap-1">
+        <div className="rounded-lg border border-violet-200 bg-violet-50/50 px-4 py-2">
+          <p className="m-0 flex items-center gap-2 text-xs font-medium text-violet-600">
+            任务计划
+            <span className="rounded bg-violet-100 px-1.5 py-0.5 text-[10px] text-violet-600">
+              {statusLabel[message.status] ?? message.status}
+            </span>
+          </p>
+          {message.tasks.length > 0 ? (
+            <ol className="m-0 mt-1.5 list-none flex-col gap-1 p-0">
+              {message.tasks.map((t) => {
+                const icon = taskIcon[t.status] ?? taskIcon.pending!;
+                return (
+                  <li
+                    key={t.id}
+                    className="flex items-start gap-1.5 text-xs text-gray-700"
+                  >
+                    <span className={cn("shrink-0", icon.cls)}>{icon.label}</span>
+                    <span className="min-w-0 break-words">{t.goal}</span>
+                  </li>
+                );
+              })}
+            </ol>
+          ) : null}
+          {message.detail ? (
+            <p className="m-0 mt-1 text-xs text-gray-500" title={message.detail}>
+              {message.detail}
+            </p>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
   if (message.role === "human") {
     return (
       <div className="group flex w-full flex-col items-end">
@@ -144,8 +197,9 @@ export const ChatMessage = memo(function ChatMessage({
               </p>
             </div>
           </div>
-          {/* 消息树操作（ADR-013）：历史消息（有 node_id）hover 显示 */}
-          {message.nodeId && !isStreaming && (
+          {/* 消息树操作（ADR-013）：历史消息（有 node_id）hover 显示。
+              树端点后端未实现，feature flag 默认隐藏整组入口。 */}
+          {MESSAGE_TREE_ENABLED && message.nodeId && !isStreaming && (
             <div className="order-2 mt-1">
               <MessageActionsMenu
                 nodeId={message.nodeId}
@@ -166,8 +220,8 @@ export const ChatMessage = memo(function ChatMessage({
         content={message.content}
         isStreaming={isStreaming}
       />
-      {/* 消息树操作（ADR-013）：分支切换器 ‹1/2› + hover 菜单 */}
-      {message.nodeId && !isStreaming && (
+      {/* 消息树操作（ADR-013）：分支切换器 ‹1/2› + hover 菜单（同上，flag 隐藏） */}
+      {MESSAGE_TREE_ENABLED && message.nodeId && !isStreaming && (
         <MessageActionsMenu
           nodeId={message.nodeId}
           role="assistant"

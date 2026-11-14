@@ -18,6 +18,7 @@ import { ThreadStatusBadge } from "./ThreadStatusBadge";
 import { useStreamContext } from "@/providers/Stream";
 import { useThreads } from "@/providers/Thread";
 import { resolveThreadStatus } from "@/lib/thread-status";
+import { MESSAGE_TREE_ENABLED } from "@/lib/feature-flags";
 
 export function AgentChatApp() {
   const stream = useStreamContext();
@@ -67,17 +68,19 @@ export function AgentChatApp() {
               <MessagesSquare className="mr-2 h-4 w-4" />
               对话列表
             </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setTreeOpen((v) => !v)}
-              disabled={!stream.threadId}
-              className={treeOpen ? "bg-accent rounded-md" : "rounded-md"}
-              title="消息树"
-            >
-              <GitBranch className="mr-2 h-4 w-4" />
-              消息树
-            </Button>
+            {MESSAGE_TREE_ENABLED && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setTreeOpen((v) => !v)}
+                disabled={!stream.threadId}
+                className={treeOpen ? "bg-accent rounded-md" : "rounded-md"}
+                title="消息树"
+              >
+                <GitBranch className="mr-2 h-4 w-4" />
+                消息树
+              </Button>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <Button
@@ -123,7 +126,7 @@ export function AgentChatApp() {
           <main className="flex flex-1 flex-col overflow-hidden">
             <ChatInterface />
           </main>
-          {treeOpen && stream.threadId && (
+          {MESSAGE_TREE_ENABLED && treeOpen && stream.threadId && (
             <aside className="border-border bg-sidebar w-[300px] shrink-0 border-l">
               <MessageTreePanel />
             </aside>

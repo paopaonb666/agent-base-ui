@@ -2,7 +2,7 @@ import { cn } from "@/lib/utils";
 import type { ThreadStatus } from "@/providers/Thread";
 
 // 配色沿袭 chat-agent 的 STATUS_CONFIG 惯例：运行中=蓝（带扩散动画）、
-// 完成=绿、中断=琥珀、失败=红——提升到会话维度。
+// 完成=绿、中断=琥珀、失败=红、等待审批=紫——提升到会话维度。
 const STATUS_CONFIG: Record<
   ThreadStatus,
   { label: string; dot: string; ping: string; text: string }
@@ -24,6 +24,12 @@ const STATUS_CONFIG: Record<
     dot: "bg-amber-500",
     ping: "",
     text: "text-amber-600",
+  },
+  paused: {
+    label: "等待审批",
+    dot: "bg-violet-500",
+    ping: "",
+    text: "text-violet-600",
   },
   error: {
     label: "对话异常",

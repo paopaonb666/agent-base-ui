@@ -2,11 +2,12 @@
 // 耗时，展开体是"参数键值行 + 结果文本"；成功与失败 alike 可展开。
 // 事件来源：池的 _TimeoutTool 经 tool_call 流事件发出的参数/结果。
 
-import { Check, ChevronDown, ChevronRight, LoaderCircle, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, LoaderCircle, Pause, X } from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 
-export type ToolStepStatus = "running" | "completed" | "error";
+// paused=审批门等待决定（#26/#62）：审批 step 的专属 chip 形态。
+export type ToolStepStatus = "running" | "completed" | "error" | "paused";
 
 // 参数值渲染上限：超长的 JSON 序列化值默认截断，点击逐项展开。
 const PARAM_PREVIEW_CHARS = 80;
@@ -54,7 +55,13 @@ export function ToolStep({
   error?: string;
 }) {
   const Icon =
-    status === "running" ? LoaderCircle : status === "completed" ? Check : X;
+    status === "running"
+      ? LoaderCircle
+      : status === "completed"
+        ? Check
+        : status === "paused"
+          ? Pause
+          : X;
   const [open, setOpen] = useState(status === "running");
   const hasBody = Boolean(
     (args && Object.keys(args).length > 0) || result || (error && detail !== error),
@@ -82,6 +89,7 @@ export function ToolStep({
               "size-4 shrink-0",
               status === "running" && "animate-spin text-amber-500",
               status === "completed" && "text-green-500",
+              status === "paused" && "text-violet-500",
               status === "error" && "text-rose-500",
             )}
           />
@@ -96,6 +104,7 @@ export function ToolStep({
                   {
                     running: "运行中",
                     completed: "已完成",
+                    paused: "等待审批",
                     error: "失败",
                   } as Record<string, string>
                 )[status] ?? status}

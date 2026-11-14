@@ -18,17 +18,21 @@ import {
   X,
 } from "lucide-react";
 import { toast } from "sonner";
+import { ApprovalCard } from "./ApprovalCard";
 import { ChatMessage } from "./ChatMessage";
 import { FilePreviewDialog, type PreviewTarget } from "./FilePreviewDialog";
 import { uploadDocument, type UploadedFile } from "@/providers/agentBaseClient";
 import { useStreamContext } from "@/providers/Stream";
 import { useTree } from "@/providers/Tree";
+import { MESSAGE_TREE_ENABLED } from "@/lib/feature-flags";
 
 // 图片（png/jpg/webp/gif）走多模态通道：vision 模型直接看图。
 const ATTACHMENT_ACCEPT =
   ".pdf,.docx,.txt,.md,.markdown,.png,.jpg,.jpeg,.webp,.gif";
 // 与后端 IMAGE_STORED_FORMATS 对齐：这些 format 的附件是图片，chip 可显示缩略图。
 const IMAGE_STORED_FORMATS = new Set(["png", "jpeg", "webp", "gif"]);
+// 对齐后端 invoke 附件上限（≤5，超出 422）：前端在选取时就地拦截。
+const MAX_ATTACHMENTS = 5;
 
 // 上传进行中的条目：chip 显示进度条，完成后转为正式附件。
 interface PendingUpload {
@@ -88,7 +92,23 @@ export function ChatInterface() {
 
   const handleFiles = async (files: FileList | File[] | null) => {
     if (!files || uploading) return;
-    for (const file of Array.from(files)) {
+    // 附件上限（对齐后端 ≤5）：选取时就地拦截，超出部分不发起上传。
+    const slots = MAX_ATTACHMENTS - attachments.length - pending.length;
+    if (slots <= 0) {
+      toast.error(`附件最多 ${MAX_ATTACHMENTS} 个`, {
+        description: "先移除部分附件再添加，或减少本轮引用的文件数。",
+        duration: 6000,
+      });
+      return;
+    }
+    const list = Array.from(files);
+    if (list.length > slots) {
+      toast.warning(`附件最多 ${MAX_ATTACHMENTS} 个`, {
+        description: `本次只取前 ${slots} 个文件，其余已忽略。`,
+        duration: 6000,
+      });
+    }
+    for (const file of list.slice(0, slots)) {
       const key = `${file.name}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       setPending((prev) => [
         ...prev,
@@ -149,8 +169,17 @@ export function ChatInterface() {
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
     const text = input.trim();
-    if ((!text && attachments.length === 0) || isLoading || pending.length > 0)
+    // 流进行中：输入框进入插话（steer）模式——Enter 把内容注入运行中的
+    // 对话（在下一个步骤边界生效），不开启新的一轮。附件在上传态之外
+    // 禁点，插话只携带文字。
+    if (isLoading) {
+      if (!text) return;
+      const content = text;
+      setInput("");
+      void stream.steer(content);
       return;
+    }
+    if ((!text && attachments.length === 0) || pending.length > 0) return;
     const attachmentMeta = attachments.map((a) => ({
       file_id: a.file_id,
       filename: a.filename,
@@ -224,7 +253,22 @@ export function ChatInterface() {
       </div>
 
       <div className="border-border bg-background flex-shrink-0 border-t p-4">
-        {branchHint && (
+        {/* 审批门暂停（#26/#62）：待审批卡 + 「继续执行」。流进行中不显示
+            （resume 端点会 409）；决定落账后由 resumeThread 重新开流。 */}
+        {stream.pausedInfo && !isLoading ? (
+          <ApprovalCard
+            apiUrl={stream.apiUrl}
+            calls={stream.pausedInfo.calls}
+            detail={stream.pausedInfo.detail}
+            kind={stream.pausedInfo.kind}
+            module={stream.module}
+            onResume={stream.resumeThread}
+            threadId={stream.pausedInfo.threadId}
+          />
+        ) : null}
+        {/* 分岔提示（ADR-013）：仅消息树入口可用时出现（flag 隐藏树后
+            branchHint 不会被置位，此处为纵深防御）。 */}
+        {MESSAGE_TREE_ENABLED && branchHint && (
           <div className="mx-auto mb-3 flex max-w-[900px] items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-800 dark:border-sky-900 dark:bg-sky-950 dark:text-sky-200">
             <GitBranch
               className="size-3.5 shrink-0"
@@ -380,7 +424,7 @@ export function ChatInterface() {
               dragActive
                 ? "松开即可添加附件…"
                 : isLoading
-                  ? "运行中…"
+                  ? "运行中…输入文字按 Enter 插话"
                   : "输入您的消息，或拖入 PDF / DOCX / TXT / MD"
             }
             rows={1}
