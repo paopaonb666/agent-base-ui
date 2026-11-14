@@ -798,6 +798,9 @@ export interface ThreadPlan {
   tasks: ThreadPlanTask[];
   cursor: number;
   replans: number;
+  /** 计划审批待决（后端 additive 键）：lastRun 终态 paused 且 marker
+   * detail=plan——历史恢复的计划门暂停线程以此为准（GUI 验收缺陷 9）。 */
+  pendingApproval?: boolean;
 }
 
 /** 读取线程当前计划。非 planner 模块（404/503）或任何失败 → null：
@@ -831,6 +834,7 @@ export async function fetchThreadPlan(args: {
         })),
       cursor: typeof body.cursor === "number" ? body.cursor : 0,
       replans: typeof body.replans === "number" ? body.replans : 0,
+      pendingApproval: body.pendingApproval === true,
     };
   } catch {
     return null;

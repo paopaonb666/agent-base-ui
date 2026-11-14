@@ -777,6 +777,31 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         if (dangling.length > 0) {
           pausedTurnsRef.current.set(target, { kind: "tool", calls: dangling });
           syncPausedInfo();
+        } else {
+          // 计划门暂停的权威探测（GUI 验收缺陷 9）：工具门=历史尾悬挂
+          // tool_calls；计划门 marker 在快照 extras、历史消息不可见——
+          // status=paused 时查 GET plan 的 pending_approval（后端权威键），
+          // 恢复视图由此获得审批卡与「继续执行」入口。
+          const thread = getThread(target);
+          if (thread?.status === "paused") {
+            try {
+              const plan = await fetchThreadPlan({
+                apiUrl: finalApiUrl,
+                module: mod,
+                threadId: target,
+              });
+              if (plan?.pendingApproval) {
+                pausedTurnsRef.current.set(target, {
+                  kind: "plan",
+                  calls: [{ callId: "plan" }],
+                });
+                syncPausedInfo();
+              }
+            } catch {
+              // 探测失败不打扰（尽力而为；本地转写含审批 chip 时 resume
+              // 仍可由后续轮次驱动）。
+            }
+          }
         }
         // 后端是该线程转写的权威来源，但只在"不少于本地"时覆盖：被停止
         // 的轮次后端可能只有更短的历史，不能拿旧快照抹掉用户刚看到的
