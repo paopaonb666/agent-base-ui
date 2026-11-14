@@ -12,6 +12,18 @@
 
 export type AgentBaseStepStatus = "running" | "completed" | "error";
 
+/** done.termination 终止原因（Java wire 扩展 #9；缺省省键=旧 wire 逐字节）。
+ * paused=审批门暂停（#26/#62），等待 approvals/{call_id} 决定 + resume 续跑。 */
+export type AgentBaseTermination =
+  | "done"
+  | "failed"
+  | "partial"
+  | "cancelled"
+  | "recursion_limit"
+  | "thread_busy"
+  | "internal_error"
+  | "paused";
+
 export interface AgentBaseSource {
   title: string;
   url?: string | null;
@@ -19,6 +31,14 @@ export interface AgentBaseSource {
 
 export type AgentBaseToolCallPhase = "start" | "end";
 export type AgentBaseToolCallStatus = "ok" | "timeout" | "error";
+
+/** planner plan 事件（模块：任务分解）。每次事件携带全量任务表，整表替换。 */
+export type AgentBasePlanStatus = "created" | "progress" | "replanned" | "done";
+export interface AgentBasePlanTask {
+  id: number;
+  goal: string;
+  status: string;
+}
 
 export type AgentBaseEvent =
   | { type: "ping" }
@@ -41,8 +61,18 @@ export type AgentBaseEvent =
     }
   | { type: "sources"; sources: AgentBaseSource[] }
   | { type: "delta"; content: string }
-  | { type: "done"; thread_id?: string | null }
-  | { type: "error"; message: string };
+  | {
+      type: "plan";
+      status: AgentBasePlanStatus;
+      plan: AgentBasePlanTask[];
+      detail?: string | null;
+    }
+  | {
+      type: "done";
+      thread_id?: string | null;
+      termination?: AgentBaseTermination;
+    }
+  | { type: "error"; message: string; code?: string };
 
 export interface InvokeAgentArgs {
   apiUrl: string;
@@ -214,6 +244,31 @@ export async function extractErrorDetail(response: Response): Promise<string> {
     // non-JSON error body; keep the status text
   }
   return `HTTP ${response.status}`;
+}
+
+/** 非流式响应统一错误出口：在 detail 之外附加行动指引——409/429 的
+ * Retry-After（后端忙线程/限流/闸门都带该头）转为可读的重试等待秒数。
+ * 调用方 catch 到的 message 自带"等多久"，不用再解析响应头。 */
+export async function throwApiError(response: Response): Promise<never> {
+  const detail = await extractErrorDetail(response);
+  const retryRaw = response.headers.get("Retry-After") ?? "";
+  const retryAfter = Number.parseInt(retryRaw, 10);
+  const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : null;
+  if (response.status === 409) {
+    throw new Error(
+      wait !== null
+        ? `${detail}（会话正忙，约 ${wait} 秒后可重试）`
+        : `${detail}（会话正忙，请稍后重试）`,
+    );
+  }
+  if (response.status === 429) {
+    throw new Error(
+      wait !== null
+        ? `${detail}（触发限流，约 ${wait} 秒后可重试）`
+        : `${detail}（触发限流，请稍后重试）`,
+    );
+  }
+  throw new Error(detail);
 }
 
 /** GET /health 的返回结构（分项健康，A4）。 */
@@ -506,18 +561,90 @@ export function parseFrame(frame: string): AgentBaseEvent | null {
     }
     case "delta":
       return { type: "delta", content: String(data.content ?? "") };
+    case "plan": {
+      // planner plan 事件：每次携带全量任务表（整表替换语义）。
+      const rawTasks = Array.isArray(data.plan) ? data.plan : [];
+      const plan: AgentBasePlanTask[] = rawTasks
+        .filter(
+          (t: unknown): t is Record<string, unknown> =>
+            typeof t === "object" &&
+            t !== null &&
+            typeof (t as Record<string, unknown>).goal === "string",
+        )
+        .map((t: Record<string, unknown>) => ({
+          id: typeof t.id === "number" ? t.id : 0,
+          goal: String(t.goal),
+          status: typeof t.status === "string" ? t.status : "pending",
+        }));
+      const status: AgentBasePlanStatus =
+        data.status === "created" ||
+        data.status === "progress" ||
+        data.status === "replanned" ||
+        data.status === "done"
+          ? data.status
+          : "progress";
+      return {
+        type: "plan",
+        status,
+        plan,
+        detail: typeof data.detail === "string" ? data.detail : null,
+      };
+    }
     case "done":
       return {
         type: "done",
         thread_id: typeof data.thread_id === "string" ? data.thread_id : null,
+        // termination 缺省省键（NON_NULL wire）；值域为后端封闭枚举，
+        // 未知新值原样透传保持前向兼容。
+        termination:
+          typeof data.termination === "string"
+            ? (data.termination as AgentBaseTermination)
+            : undefined,
       };
     case "error":
       return {
         type: "error",
         message: String(data.message ?? "unknown error"),
+        code: typeof data.code === "string" ? data.code : undefined,
       };
     default:
       return null; // ignore unknown events for forward compatibility
+  }
+}
+
+/** 共享 SSE 读循环：从已建立的 response 逐帧产出事件。
+ * 读超时/网络错误时取消底层流（触发后端"断连 => 取消 LLM"路径）。 */
+async function* readSseStream(
+  response: Response,
+): AsyncGenerator<AgentBaseEvent> {
+  if (!response.body) {
+    throw new Error("agent-base responded without a body stream");
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await readChunkWithTimeout(
+        reader,
+        READ_TIMEOUT_MS,
+      );
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buffer.indexOf("\n\n")) >= 0) {
+        const frame = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const event = parseFrame(frame);
+        if (event) yield event;
+      }
+    }
+  } catch (err) {
+    // 读超时/网络错误：取消底层流，触发服务端的"断连 => 取消 LLM"路径。
+    await reader.cancel().catch(() => {});
+    throw err;
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -525,7 +652,8 @@ export function parseFrame(frame: string): AgentBaseEvent | null {
  * Invoke one agent turn and consume the SSE stream as an async sequence.
  *
  * Throws an Error with a readable message for non-2xx responses or network
- * failures. Cancellation is Cooperated via `signal` (the backend also
+ * failures (409/429 additionally carry the Retry-After wait, see
+ * throwApiError). Cancellation is Cooperated via `signal` (the backend also
  * aborts its LLM call on client disconnect).
  */
 export async function* invokeAgent(
@@ -560,38 +688,152 @@ export async function* invokeAgent(
   });
 
   if (!response.ok) {
-    throw new Error(await extractErrorDetail(response));
+    await throwApiError(response);
   }
 
-  if (!response.body) {
-    throw new Error("agent-base responded without a body stream");
-  }
+  yield* readSseStream(response);
+}
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+export interface ResumeAgentArgs {
+  apiUrl: string;
+  module: string;
+  threadId: string;
+  requestId?: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * 恢复一个被审批门暂停/中断的会话（Java wire 扩展 #8 resume）：后端按
+ * pending_approval.resume_node 以空输入重入图，事件流与 invoke 同构——
+ * 调用方复用同一套事件管线。错误语义：404=无可恢复记录/非属主/未知模块
+ * （掩蔽）；400=上一轮已正常结束（done）；409=线程忙（Retry-After: 5）。
+ */
+export async function* resumeAgent(
+  args: ResumeAgentArgs,
+): AsyncGenerator<AgentBaseEvent> {
+  const { apiUrl, module, threadId, requestId: rid = requestId(), signal } =
+    args;
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(module)}/threads/${encodeURIComponent(threadId)}/resume`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Request-ID": rid,
+    },
+    signal,
+  });
+  if (!response.ok) {
+    await throwApiError(response);
+  }
+  yield* readSseStream(response);
+}
+
+/** 运行中插话（#7 steering）：content 在下一个步边界注入为 UserMessage，
+ * 并伴随一个 name="steer" 的 step 事件。尽力投递：run 最后一个步边界
+ * 之后到达的插话随 run 终止丢弃。404=无在途 run/非属主/未知模块（掩蔽）；
+ * 429=插话队列满（容量 16）。 */
+export async function steerThread(args: {
+  apiUrl: string;
+  module: string;
+  threadId: string;
+  content: string;
+  kind?: "user" | "system";
+  signal?: AbortSignal;
+}): Promise<{ thread_id: string; module: string; queued: boolean }> {
+  const { apiUrl, module, threadId, content, kind = "user", signal } = args;
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(module)}/threads/${encodeURIComponent(threadId)}/steer`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content, kind }),
+    signal,
+  });
+  if (!response.ok) await throwApiError(response);
+  return (await response.json()) as {
+    thread_id: string;
+    module: string;
+    queued: boolean;
+  };
+}
+
+/** 审批门决定（#26 工具门 / #62 计划门）：callId 是暂停快照尾 assistant
+ * 悬挂 tool_calls 的调用 id，或计划审批的保留键 "plan"。decision=approve
+ * 批准执行 / reject 回喂拒绝提示（TTL 过期服务端视同拒绝）。决定落账后
+ * 需再调 resumeAgent 续跑——本函数只落决定，不开流。 */
+export async function postApproval(args: {
+  apiUrl: string;
+  module: string;
+  threadId: string;
+  callId: string;
+  decision: "approve" | "reject";
+  signal?: AbortSignal;
+}): Promise<{ thread_id: string; call_id: string; decision: string }> {
+  const { apiUrl, module, threadId, callId, decision, signal } = args;
+  const url = `${apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(module)}/threads/${encodeURIComponent(threadId)}/approvals/${encodeURIComponent(callId)}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ decision }),
+    signal,
+  });
+  if (!response.ok) await throwApiError(response);
+  return (await response.json()) as {
+    thread_id: string;
+    call_id: string;
+    decision: string;
+  };
+}
+
+/** GET .../plan 返回的任务条目（与 plan 事件的 plan[] 同形）。 */
+export interface ThreadPlanTask {
+  id: number;
+  goal: string;
+  status: string;
+}
+
+/** 线程当前计划（planner 模块；plan 存储或图状态派生）。 */
+export interface ThreadPlan {
+  thread_id: string;
+  module: string;
+  tasks: ThreadPlanTask[];
+  cursor: number;
+  replans: number;
+}
+
+/** 读取线程当前计划。非 planner 模块（404/503）或任何失败 → null：
+ * 本函数服务于历史回放的补渲染，失败属预期路径不做错误噪音。 */
+export async function fetchThreadPlan(args: {
+  apiUrl: string;
+  module: string;
+  threadId: string;
+  signal?: AbortSignal;
+}): Promise<ThreadPlan | null> {
+  const url = `${args.apiUrl.replace(/\/+$/, "")}/v1/agents/${encodeURIComponent(args.module)}/threads/${encodeURIComponent(args.threadId)}/plan`;
   try {
-    while (true) {
-      const { done, value } = await readChunkWithTimeout(
-        reader,
-        READ_TIMEOUT_MS,
-      );
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let idx: number;
-      while ((idx = buffer.indexOf("\n\n")) >= 0) {
-        const frame = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        const event = parseFrame(frame);
-        if (event) yield event;
-      }
-    }
-  } catch (err) {
-    // 读超时/网络错误：取消底层流，触发服务端的"断连 => 取消 LLM"路径。
-    await reader.cancel().catch(() => {});
-    throw err;
-  } finally {
-    reader.releaseLock();
+    const response = await fetch(url, { signal: args.signal });
+    if (!response.ok) return null;
+    const body = (await response.json()) as Partial<ThreadPlan>;
+    if (!Array.isArray(body.tasks)) return null;
+    return {
+      thread_id: typeof body.thread_id === "string" ? body.thread_id : "",
+      module: typeof body.module === "string" ? body.module : "",
+      tasks: (body.tasks as unknown[])
+        .filter(
+          (t: unknown): t is Record<string, unknown> =>
+            typeof t === "object" &&
+            t !== null &&
+            typeof (t as Record<string, unknown>).goal === "string",
+        )
+        .map((t: Record<string, unknown>) => ({
+          id: typeof t.id === "number" ? t.id : 0,
+          goal: String(t.goal),
+          status: typeof t.status === "string" ? t.status : "pending",
+        })),
+      cursor: typeof body.cursor === "number" ? body.cursor : 0,
+      replans: typeof body.replans === "number" ? body.replans : 0,
+    };
+  } catch {
+    return null;
   }
 }
 

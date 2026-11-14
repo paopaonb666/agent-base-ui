@@ -24,7 +24,11 @@ import {
   listKnowledgeFiles,
   listModules,
   parseFrame,
+  postApproval,
+  resumeAgent,
   revokeFile,
+  steerThread,
+  fetchThreadPlan,
 } from "../src/providers/agentBaseClient";
 
 function sseResponse(frames: string[]): Response {
@@ -154,7 +158,7 @@ describe("invokeAgent", () => {
     })) {
       // 空流
     }
-    expect(String(fetchMock.mock.calls[0][0])).toBe(
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
       "http://b/v1/agents/chat/invoke",
     );
   });
@@ -181,7 +185,7 @@ describe("fetchThreadHistory / fetchHealth / listModules", () => {
       threadId: "t1",
     });
     expect(history.messages).toHaveLength(1);
-    expect(String(fetchMock.mock.calls[0][0])).toBe(
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
       "http://b/v1/agents/chat/threads/t1",
     );
   });
@@ -662,5 +666,217 @@ describe("message tree API", () => {
     expect(body.parent_node_id).toBe("n9");
     expect(body.regenerate).toBe(true);
     expect(events.at(-1)).toEqual({ type: "done", thread_id: "t1" });
+  });
+});
+
+describe("wire 扩展：plan 事件 / termination / code / steer / resume / approvals", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** 取第 index 次调用的 RequestInit（本块局部 helper，同树 API 块约定）。 */
+  function initOf(mock: ReturnType<typeof vi.fn>, index: number): RequestInit {
+    return (mock.mock.calls[index]?.[1] ?? {}) as RequestInit;
+  }
+
+  it("parseFrame 解析 plan 事件（任务表逐项 narrowing）", () => {
+    const frame =
+      'event: plan\ndata: {"type":"plan","status":"progress","plan":[{"id":1,"goal":"查天气","status":"done"},{"id":2,"goal":"写总结","status":"pending"},{"bad":1}],"detail":"延续既有计划（cursor=1）"}';
+    expect(parseFrame(frame)).toEqual({
+      type: "plan",
+      status: "progress",
+      plan: [
+        { id: 1, goal: "查天气", status: "done" },
+        { id: 2, goal: "写总结", status: "pending" },
+      ],
+      detail: "延续既有计划（cursor=1）",
+    });
+    // 非法 status 回落 progress；plan 缺失 → 空表
+    expect(
+      parseFrame('event: plan\ndata: {"type":"plan","status":"weird"}'),
+    ).toEqual({ type: "plan", status: "progress", plan: [], detail: null });
+  });
+
+  it("done 事件携带 termination；缺省省键时为 undefined（旧 wire 逐字节）", () => {
+    expect(
+      parseFrame(
+        'event: done\ndata: {"type":"done","thread_id":"t1","termination":"paused"}',
+      ),
+    ).toEqual({ type: "done", thread_id: "t1", termination: "paused" });
+    expect(parseFrame('event: done\ndata: {"type":"done"}')).toEqual({
+      type: "done",
+      thread_id: null,
+    });
+  });
+
+  it("error 事件携带 code 键（缺省省键）", () => {
+    expect(
+      parseFrame(
+        'event: error\ndata: {"type":"error","message":"忙","code":"thread_busy"}',
+      ),
+    ).toEqual({ type: "error", message: "忙", code: "thread_busy" });
+    expect(parseFrame('event: error\ndata: {"type":"error","message":"x"}')).toEqual({
+      type: "error",
+      message: "x",
+    });
+  });
+
+  it("invoke 409/429 错误附 Retry-After 等待指引", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ detail: "线程忙", code: "thread_busy" }), {
+            status: 409,
+            headers: { "Content-Type": "application/json", "Retry-After": "5" },
+          }),
+      ),
+    );
+    await expect(
+      invokeAgent({ apiUrl: "http://b", module: "chat", message: "hi" }).next(),
+    ).rejects.toThrow("会话正忙，约 5 秒后可重试");
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ detail: "too many" }), {
+            status: 429,
+            headers: { "Content-Type": "application/json", "Retry-After": "60" },
+          }),
+      ),
+    );
+    await expect(
+      invokeAgent({ apiUrl: "http://b", module: "chat", message: "hi" }).next(),
+    ).rejects.toThrow("触发限流，约 60 秒后可重试");
+
+    // 无 Retry-After 头：不编造秒数
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ detail: "gate" }), {
+            status: 429,
+            headers: { "Content-Type": "application/json" },
+          }),
+      ),
+    );
+    await expect(
+      invokeAgent({ apiUrl: "http://b", module: "chat", message: "hi" }).next(),
+    ).rejects.toThrow("触发限流，请稍后重试");
+  });
+
+  it("resumeAgent 走 resume 端点并消费 SSE 事件流", async () => {
+    const fetchMock = vi.fn(async (_url?: string, init?: RequestInit) =>
+      sseResponse([
+        'event: step\ndata: {"type":"step","name":"tools","status":"running"}\n\n',
+        'event: done\ndata: {"type":"done","thread_id":"t1","termination":"done"}\n\n',
+      ]),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const events: unknown[] = [];
+    for await (const event of resumeAgent({
+      apiUrl: "http://b",
+      module: "chat",
+      threadId: "t1",
+      requestId: "rid9",
+    })) {
+      events.push(event);
+    }
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://b/v1/agents/chat/threads/t1/resume",
+    );
+    expect(initOf(fetchMock, 0).method).toBe("POST");
+    expect(initOf(fetchMock, 0).headers).toMatchObject({
+      "X-Request-ID": "rid9",
+    });
+    expect(events).toHaveLength(2);
+    expect(events[1]).toMatchObject({ termination: "done" });
+  });
+
+  it("steerThread POST {content, kind=user} 到 steer 端点", async () => {
+    const fetchMock = vi.fn(async (_url?: string, init?: RequestInit) =>
+      jsonResponse({ thread_id: "t1", module: "chat", queued: true }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await steerThread({
+      apiUrl: "http://b",
+      module: "chat",
+      threadId: "t1",
+      content: "聚焦第一点",
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://b/v1/agents/chat/threads/t1/steer",
+    );
+    expect(JSON.parse(String(initOf(fetchMock, 0).body))).toEqual({
+      content: "聚焦第一点",
+      kind: "user",
+    });
+    expect(result.queued).toBe(true);
+  });
+
+  it("postApproval POST decision 到 approvals/{callId}（含保留键 plan）", async () => {
+    const fetchMock = vi.fn(async (_url?: string, init?: RequestInit) =>
+      jsonResponse({ thread_id: "t1", call_id: "plan", decision: "approve" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await postApproval({
+      apiUrl: "http://b",
+      module: "planner",
+      threadId: "t1",
+      callId: "plan",
+      decision: "approve",
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://b/v1/agents/planner/threads/t1/approvals/plan",
+    );
+    expect(JSON.parse(String(initOf(fetchMock, 0).body))).toEqual({
+      decision: "approve",
+    });
+    expect(result.call_id).toBe("plan");
+  });
+
+  it("fetchThreadPlan 解析任务表；404/503 与网络失败返回 null", async () => {
+    const fetchMock = vi.fn(async (_url?: string, _init?: RequestInit) =>
+      jsonResponse({
+        thread_id: "t1",
+        module: "planner",
+        tasks: [
+          { id: 1, goal: "拆解", status: "done" },
+          { id: 2, goal: "执行", status: "pending" },
+        ],
+        cursor: 1,
+        replans: 0,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const plan = await fetchThreadPlan({
+      apiUrl: "http://b",
+      module: "planner",
+      threadId: "t1",
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      "http://b/v1/agents/planner/threads/t1/plan",
+    );
+    expect(plan?.tasks).toHaveLength(2);
+    expect(plan?.cursor).toBe(1);
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ detail: "not a planner" }, 503)),
+    );
+    expect(
+      await fetchThreadPlan({ apiUrl: "http://b", module: "chat", threadId: "t1" }),
+    ).toBeNull();
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network down");
+      }),
+    );
+    expect(
+      await fetchThreadPlan({ apiUrl: "http://b", module: "chat", threadId: "t1" }),
+    ).toBeNull();
   });
 });
