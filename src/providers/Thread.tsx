@@ -306,9 +306,13 @@ function readThreads(): RecentThread[] {
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
+    // 读取侧同上限裁剪（GUI 验收二轮噪音 7）：上限语义只挂在保存路径时，
+    // 旧数据/外部写入的超量索引会整表渲染且永不收敛。保留最新 MAX_THREADS
+    // 条（与 saveThread 的 slice 口径一致）。
     return parsed
       .map(sanitizeThread)
-      .filter((t): t is RecentThread => t !== null);
+      .filter((t): t is RecentThread => t !== null)
+      .slice(0, MAX_THREADS);
   } catch {
     return [];
   }

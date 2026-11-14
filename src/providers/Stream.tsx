@@ -166,6 +166,18 @@ const MODULE_STORAGE_KEY = "agent-base-ui:module";
 const LAST_THREAD_KEY = "agent-base-ui:lastThread";
 
 /**
+ * 请求失败的 toast 文案（GUI 验收二轮噪音 1）：fetch 的网络层失败以原始
+ * TypeError（"Failed to fetch"/"network error"）冒出，全中文界面里夹一条
+ * 裸英文串——翻译成行动指引；其余（throwApiError 组装的中文文案）原样。
+ */
+function friendlyRequestError(err: unknown): string {
+  if (err instanceof TypeError) {
+    return "无法连接 agent-base 服务，请检查服务地址与网络后重试";
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
  * 把远端历史的树锚点（node_id/label/starred，ADR-013）按**角色序列对齐**
  * 回填到本地转写。本地转写可能比后端历史"长"（步骤徽标是本地独有的
  * 视觉条目）——不能按总长度判断：远端每条在本地序列里找同角色（tool
@@ -774,6 +786,8 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
                   : m,
               ) as UiMessage[])
             : rawRemote;
+        // 计划门待批信号：探测结果留给下方的暂停对账分支使用。
+        let planPending = false;
         if (dangling.length > 0) {
           pausedTurnsRef.current.set(target, { kind: "tool", calls: dangling });
           syncPausedInfo();
@@ -782,7 +796,6 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           // tool_calls；计划门 marker 在快照 extras、历史消息不可见——
           // status=paused 时查 GET plan 的 pending_approval（后端权威键），
           // 恢复视图由此获得审批卡与「继续执行」入口。
-          const thread = getThread(target);
           if (thread?.status === "paused") {
             try {
               const plan = await fetchThreadPlan({
@@ -791,6 +804,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
                 threadId: target,
               });
               if (plan?.pendingApproval) {
+                planPending = true;
                 pausedTurnsRef.current.set(target, {
                   kind: "plan",
                   calls: [{ callId: "plan" }],
@@ -802,6 +816,31 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
               // 仍可由后续轮次驱动）。
             }
           }
+        }
+        // 暂停态对账（GUI 验收二轮 D7）：本地仍停留在暂停快照（索引
+        // status=paused 或转写含等待审批的工具卡）、而服务端已不在任何
+        // 暂停态（工具门无悬挂 tool_calls 且计划门无 pending_approval）
+        // → 后端历史无条件接管，并把索引里冻结的 paused 修正为 ended。
+        // 长度比较在此失真：暂停转写含 UI 合成的审批卡等消息，完成态
+        // 历史未必更长——沿用长度规则会让旁路完成（跨标签/跨设备 resume）
+        // 的线程永远渲染死审批卡。仍处暂停态（工具门悬挂/计划门待批）
+        // 时不接管，恢复语义不变。
+        const storedLooksPaused =
+          thread?.status === "paused" ||
+          (stored ?? []).some((m) => m.role === "tool" && m.status === "paused");
+        if (storedLooksPaused && dangling.length === 0 && !planPending) {
+          setTranscript(target, remote);
+          if (thread && thread.status === "paused") {
+            saveThread({
+              threadId: target,
+              title: thread.title,
+              module: thread.module,
+              updatedAt: thread.updatedAt,
+              messages: remote,
+              status: "ended",
+            });
+          }
+          return;
         }
         // 后端是该线程转写的权威来源，但只在"不少于本地"时覆盖：被停止
         // 的轮次后端可能只有更短的历史，不能拿旧快照抹掉用户刚看到的
@@ -988,6 +1027,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       abortRefs.current.set(turnThreadId, controller);
       let aborted = false;
       let failed = false;
+      let gateRejected = false;
       // 重新生成（ADR-013）：收尾以远端新活跃路径整体覆盖本地——本地
       // 转写里还留着被替换出路径的旧回复，对齐合并的语义不适用。
       const usedRegenerate = regenerate;
@@ -1009,9 +1049,16 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         }
       } catch (err) {
         aborted = err instanceof Error && err.name === "AbortError";
+        // 门拒绝（409 忙 / 429 限流）：run 从未启动，线程的真实状态未被
+        // 本轮触碰——沿用索引里的既有收尾状态，不污染为异常（GUI 验收
+        // 二轮 D8：标签 B 撞 409 会把标签 A 正在对话的线程染成「对话异
+        // 常」，双标签从此各自展示互相矛盾的状态点）。
+        gateRejected =
+          !aborted && (err as { status?: number }).status === 409 ||
+          !aborted && (err as { status?: number }).status === 429;
         if (!aborted) {
-          failed = true;
-          const message = err instanceof Error ? err.message : String(err);
+          failed = !gateRejected;
+          const message = friendlyRequestError(err);
           if (activeThreadRef.current === turnThreadId) setError(message);
           toast.error("请求 agent-base 失败", {
             description: (
@@ -1045,15 +1092,18 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         setTranscript(turnThreadId, transcript);
 
         // 会话收尾状态：用户停止 = 终止；请求失败或后端报错 = 异常；
-        // 审批门暂停 = 等待审批（后端持久态，刷新后可续跑）；其余 =
-        // 正常结束——显式区分开，供侧栏/顶栏的状态点展示。
+        // 审批门暂停 = 等待审批（后端持久态，刷新后可续跑）；门拒绝
+        // （409/429，GUI 验收二轮 D8）= run 从未启动，沿用既有状态；
+        // 其余 = 正常结束——显式区分开，供侧栏/顶栏的状态点展示。
         const finalStatus: ThreadStatus = aborted
           ? "terminated"
           : turnState.paused
             ? "paused"
-            : failed || turnState.backendErrored
-              ? "error"
-              : "ended";
+            : gateRejected
+              ? getThread(turnThreadId)?.status ?? "ended"
+              : failed || turnState.backendErrored
+                ? "error"
+                : "ended";
 
         // Persist the thread (with its full transcript) so the history
         // sidebar can reopen it later. A fully rolled-back turn has nothing
@@ -1181,6 +1231,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     void (async () => {
       let aborted = false;
       let failed = false;
+      let gateRejected = false;
       try {
         for await (const event of resumeAgent({
           apiUrl: finalApiUrl,
@@ -1194,9 +1245,14 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         }
       } catch (err) {
         aborted = err instanceof Error && err.name === "AbortError";
+        // 门拒绝（409/429）：语义同 invoke 轮（GUI 验收二轮 D8）——run 未
+        // 启动，不把线程落库状态污染为异常。
+        gateRejected =
+          !aborted && (err as { status?: number }).status === 409 ||
+          !aborted && (err as { status?: number }).status === 429;
         if (!aborted) {
-          failed = true;
-          const message = err instanceof Error ? err.message : String(err);
+          failed = !gateRejected;
+          const message = friendlyRequestError(err);
           if (activeThreadRef.current === id) setError(message);
           toast.error("请求 agent-base 失败", {
             description: (
@@ -1223,9 +1279,11 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           ? "terminated"
           : turnState.paused
             ? "paused"
-            : failed || turnState.backendErrored
-              ? "error"
-              : "ended";
+            : gateRejected
+              ? getThread(id)?.status ?? "ended"
+              : failed || turnState.backendErrored
+                ? "error"
+                : "ended";
         const t = getThread(id);
         saveThread({
           threadId: id,
@@ -1277,7 +1335,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           });
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const message = friendlyRequestError(err);
         toast.error("插话发送失败", {
           description: (
             <p>

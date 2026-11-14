@@ -248,27 +248,34 @@ export async function extractErrorDetail(response: Response): Promise<string> {
 
 /** 非流式响应统一错误出口：在 detail 之外附加行动指引——409/429 的
  * Retry-After（后端忙线程/限流/闸门都带该头）转为可读的重试等待秒数。
- * 调用方 catch 到的 message 自带"等多久"，不用再解析响应头。 */
+ * 调用方 catch 到的 message 自带"等多久"，不用再解析响应头。错误对象
+ * 另挂 `status`（HTTP 状态码）——调用方据此区分「门拒绝」（409/429，
+ * run 从未启动，线程落库状态不应被污染为异常，见 Stream 的收尾逻辑）。 */
 export async function throwApiError(response: Response): Promise<never> {
   const detail = await extractErrorDetail(response);
   const retryRaw = response.headers.get("Retry-After") ?? "";
   const retryAfter = Number.parseInt(retryRaw, 10);
   const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : null;
+  const fail = (message: string): never => {
+    const err = new Error(message) as Error & { status?: number };
+    err.status = response.status;
+    throw err;
+  };
   if (response.status === 409) {
-    throw new Error(
+    return fail(
       wait !== null
         ? `${detail}（会话正忙，约 ${wait} 秒后可重试）`
         : `${detail}（会话正忙，请稍后重试）`,
     );
   }
   if (response.status === 429) {
-    throw new Error(
+    return fail(
       wait !== null
         ? `${detail}（触发限流，约 ${wait} 秒后可重试）`
         : `${detail}（触发限流，请稍后重试）`,
     );
   }
-  throw new Error(detail);
+  return fail(detail);
 }
 
 /** GET /health 的返回结构（分项健康，A4）。 */
@@ -679,6 +686,11 @@ export async function* invokeAgent(
     },
     body: JSON.stringify({
       message,
+      // mode=auto（GUI 验收二轮 D2）：后端 M9 难度分流——>200 字符或带附件
+      // 走 planner，其余维持请求模块直答。此前 payload 从不携带 mode，后端
+      // 默认 chat，auto 分流从 GUI 永远不可达。thread 前缀/记忆 agent_id/
+      // 附件绑定等仍维持请求模块不变（后端决策 5）。
+      mode: "auto",
       ...(threadId ? { thread_id: threadId } : {}),
       ...(parentNodeNodeId ? { parent_node_id: parentNodeNodeId } : {}),
       ...(regenerate ? { regenerate: true } : {}),
@@ -815,7 +827,9 @@ export async function fetchThreadPlan(args: {
   try {
     const response = await fetch(url, { signal: args.signal });
     if (!response.ok) return null;
-    const body = (await response.json()) as Partial<ThreadPlan>;
+    const body = (await response.json()) as Partial<ThreadPlan> & {
+      pending_approval?: boolean;
+    };
     if (!Array.isArray(body.tasks)) return null;
     return {
       thread_id: typeof body.thread_id === "string" ? body.thread_id : "",
@@ -834,7 +848,10 @@ export async function fetchThreadPlan(args: {
         })),
       cursor: typeof body.cursor === "number" ? body.cursor : 0,
       replans: typeof body.replans === "number" ? body.replans : 0,
-      pendingApproval: body.pendingApproval === true,
+      // wire 字段是 snake_case（后端 AgentsRoutes plan 端点 put("pending_approval",
+      // …)）——GUI 验收二轮修复：此前读 body.pendingApproval（camelCase）恒
+      // undefined，计划门恢复探测从未拿到权威信号，恢复视图永远没有审批卡。
+      pendingApproval: body.pending_approval === true,
     };
   } catch {
     return null;
