@@ -130,14 +130,17 @@ const defaultComponents: any = {
   ),
   p: ({ className, ...props }: { className?: string }) => (
     <p
-      className={cn("mt-5 mb-5 leading-7 first:mt-0 last:mb-0", className)}
+      className={cn(
+        "mt-5 mb-5 leading-7 first:mt-0 last:mb-0 [overflow-wrap:anywhere]",
+        className,
+      )}
       {...props}
     />
   ),
   a: ({ className, ...props }: { className?: string }) => (
     <a
       className={cn(
-        "text-primary font-medium underline underline-offset-4",
+        "text-primary font-medium underline underline-offset-4 [overflow-wrap:anywhere]",
         className,
       )}
       {...props}
