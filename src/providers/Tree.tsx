@@ -17,6 +17,7 @@ import {
   type ReactNode,
 } from "react";
 import { toast } from "sonner";
+import { MESSAGE_TREE_ENABLED } from "@/lib/feature-flags";
 import {
   deleteTreeNode,
   exportThreadTree,
@@ -80,6 +81,12 @@ export function TreeProvider({ children }: { children: ReactNode }) {
   const prevLoadingRef = useRef(stream.isLoading);
 
   const refresh = useCallback(async () => {
+    // 消息树 feature flag 关闭时数据层整体静默（GUI 验收缺陷 6）：树端点
+    // 后端未实现——此前只隐藏了 UI 入口，provider 仍对每次会话切换/收尾
+    // 请求不存在的 /tree（404/500 日志噪音）。
+    if (!MESSAGE_TREE_ENABLED) {
+      return;
+    }
     if (!threadId || !apiUrl) {
       setTree(null);
       return;
