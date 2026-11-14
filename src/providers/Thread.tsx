@@ -65,7 +65,7 @@ export type ThreadMessage =
       id: string;
       role: "tool";
       name: string;
-      status: "running" | "completed" | "error";
+      status: "running" | "completed" | "error" | "paused";
       detail?: string;
       result?: string;
       /** 工具调用记录（M5）：与流式 tool_call 事件/后端历史配对的字段。 */
@@ -74,14 +74,29 @@ export type ThreadMessage =
       duration_ms?: number;
       error?: string;
     } & MessageTreeMeta)
-  | { id: string; role: "sources"; sources: SourceRef[] };
+  | { id: string; role: "sources"; sources: SourceRef[] }
+  | {
+      /** planner plan 事件（#96 planner 任务卡）：每次事件整表替换。 */
+      id: string;
+      role: "plan";
+      status: "created" | "progress" | "replanned" | "done";
+      tasks: { id: number; goal: string; status: string }[];
+      detail?: string;
+    };
 
 // 会话级状态（参考 chat-agent 的步骤/工具状态色板，提升到会话维度）：
 //   streaming  — 正在对话（流进行中的运行时状态）
 //   ended      — 对话结束（正常完成）
 //   terminated — 对话终止（用户停止、页面刷新/关闭打断）
 //   error      — 对话异常（请求失败、后端返回错误事件）
-export type ThreadStatus = "streaming" | "ended" | "terminated" | "error";
+//   paused     — 等待审批（审批门暂停：工具门/计划门，后端持久态——刷新后
+//                仍可恢复续跑，不降级）
+export type ThreadStatus =
+  | "streaming"
+  | "ended"
+  | "terminated"
+  | "error"
+  | "paused";
 
 export interface RecentThread {
   threadId: string;
@@ -122,8 +137,11 @@ const ThreadContext = createContext<ThreadContextType | undefined>(undefined);
 
 // 只接受合法枚举；残留的 "streaming" 说明上次会话在流进行中被刷新/关闭
 // 打断（与 sanitizeMessages 把残留 running 步骤改成 error 是同一个道理）。
+// "paused" 是后端持久态（审批门暂停，快照带 pending_approval），刷新后
+// 仍可恢复续跑——保留不降级。
 function sanitizeStatus(raw: unknown): ThreadStatus | undefined {
   if (raw === "ended" || raw === "terminated" || raw === "error") return raw;
+  if (raw === "paused") return "paused";
   if (raw === "streaming") return "terminated";
   return undefined;
 }
@@ -172,8 +190,14 @@ function sanitizeMessages(messages: unknown): ThreadMessage[] {
           : {}),
       });
     } else if (role === "tool") {
+      // "paused"（等待审批）是后端持久态的视觉对应——审批门暂停的线程里
+      // 悬挂调用卡在刷新后仍应显示为待审批而非报错（配合 status=paused）。
       const status =
-        m.status === "completed" || m.status === "error" ? m.status : "error";
+        m.status === "completed" ||
+        m.status === "error" ||
+        m.status === "paused"
+          ? m.status
+          : "error";
       const rawArgs: unknown = m.args;
       out.push({
         id,
@@ -222,6 +246,36 @@ function sanitizeMessages(messages: unknown): ThreadMessage[] {
       if (sources.length > 0) {
         out.push({ id, role: "sources", sources });
       }
+    } else if (role === "plan") {
+      // planner plan 事件卡：任务表逐项 narrowing，status 闭集校验。
+      const rawTasks = Array.isArray(m.tasks) ? m.tasks : [];
+      const tasks = rawTasks
+        .filter(
+          (t: unknown): t is Record<string, unknown> =>
+            typeof t === "object" &&
+            t !== null &&
+            typeof (t as Record<string, unknown>).goal === "string",
+        )
+        .slice(0, 100)
+        .map((t: Record<string, unknown>) => ({
+          id: typeof t.id === "number" ? t.id : 0,
+          goal: String(t.goal),
+          status: typeof t.status === "string" ? t.status : "pending",
+        }));
+      const planStatus =
+        m.status === "created" ||
+        m.status === "progress" ||
+        m.status === "replanned" ||
+        m.status === "done"
+          ? m.status
+          : "progress";
+      out.push({
+        id,
+        role: "plan",
+        status: planStatus,
+        tasks,
+        ...(typeof m.detail === "string" && m.detail ? { detail: m.detail } : {}),
+      });
     }
   }
   return out;

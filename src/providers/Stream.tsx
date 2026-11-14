@@ -17,8 +17,11 @@ import {
 import {
   AgentBaseEvent,
   fetchThreadHistory,
+  fetchThreadPlan,
   invokeAgent,
   requestId,
+  resumeAgent,
+  steerThread as steerThreadApi,
   type ThreadHistoryMessage,
 } from "./agentBaseClient";
 // UI message model — minimal by design:
@@ -64,6 +67,15 @@ export interface StreamState {
   /** 该线程是否正在流式对话（按线程追踪，与活跃视图无关）。渲染期调用，
    *  流开始/结束时由 streamingTrigger 触发重算（与 isLoading 同款机制）。 */
   isThreadStreaming: (threadId: string) => boolean;
+  /** 当前活跃线程的待审批信息（审批门暂停）；null=无可审批项。
+   *  决定落账走 postApproval 客户端函数，全部决定后调 resumeThread 续跑。 */
+  pausedInfo: (PendingApproval & { threadId: string }) | null;
+  /** 继续执行：对审批门暂停的活跃线程调 resume 端点重新开流（复用
+   *  事件管线；非暂停态/流进行中为 no-op）。 */
+  resumeThread: () => void;
+  /** 运行中插话（steer）：仅在活跃线程流进行中有效；成功 toast，
+   *  失败（404 无在途 run / 429 队列满）由错误 toast 带出。 */
+  steer: (content: string) => Promise<void>;
 }
 
 const StreamContext = createContext<StreamState | undefined>(undefined);
@@ -168,7 +180,9 @@ function mergeTreeAnchors(
   let li = 0;
   const merged = local.map((m) => m);
   for (const r of remote) {
-    if (r.role === "sources") continue;
+    // 远端（历史回放）不会有 sources/plan 条目，但类型上是同一联合——
+    // 显式跳过让 r 收窄到带树锚点的三角色。
+    if (r.role === "sources" || r.role === "plan") continue;
     while (
       li < local.length &&
       (local[li].role === "sources" ||
@@ -181,7 +195,8 @@ function mergeTreeAnchors(
     }
     if (li >= local.length) break;
     const m = local[li];
-    if (m.role === "sources") {
+    if (m.role === "sources" || m.role === "plan") {
+      // 本地独有的视觉条目（引用卡/计划卡）不参与锚点对齐。
       li += 1;
       continue;
     }
@@ -197,6 +212,263 @@ function mergeTreeAnchors(
     li += 1;
   }
   return changed ? merged : null;
+}
+
+// ── 审批门暂停（Java wire 扩展 #26/#62） ──────────────────────────────
+
+/** 审批门暂停时等待决定的一个调用（工具门=悬挂 tool_calls；计划门=保留键 "plan"）。 */
+export interface PendingApprovalCall {
+  callId: string;
+  name?: string;
+  args?: Record<string, unknown>;
+}
+
+/** 一轮暂停的待审批信息：kind=tool 逐调用批准/拒绝；kind=plan 对整个计划
+ * 一次决定。calls 为空（历史拉取失败）时 UI 退化为「直接继续/放弃」。 */
+export interface PendingApproval {
+  kind: "tool" | "plan";
+  /** 审批 step 的 detail（pending_calls=N;tools=a|b 或 "plan"），兜底展示。 */
+  detail?: string;
+  calls: PendingApprovalCall[];
+}
+
+/** 一轮流式的可变状态：由 createEventApplier 就地更新、finally 收尾读取。 */
+interface TurnState {
+  firstDeltaSeen: boolean;
+  backendErrored: boolean;
+  /** done 事件 termination="paused"：本轮以审批暂停收尾。 */
+  paused: boolean;
+  /** 审批 step 的 detail（计划门="plan"；工具门=pending_calls=N;tools=…）。 */
+  approvalDetail: string | null;
+}
+
+/**
+ * 事件处理器工厂（按轮创建）：把 applyEvent 从 sendMessage 闭包提为可复用
+ * 形态——invoke 轮与 resume 轮共用同一套事件→转写映射。running/completed
+ * 的 FIFO 配对、tool_call 的 call_id 配对语义与旧实现逐字节一致。
+ */
+function createEventApplier(
+  rid: string,
+  state: TurnState,
+  onError: (message: string) => void,
+): (event: AgentBaseEvent, current: UiMessage[]) => UiMessage[] {
+  // 同名步骤在同一轮里可以出现多次（agent → tools → agent），而且
+  // 模型可以在一条消息里并行发多个同名工具调用（如两次 web_search），
+  // 各自的 running/completed 事件按到达顺序交错。按 name 维护 FIFO 队列：
+  // running 入队，completed 出队，与事件到达顺序天然配对；没有对应
+  // running 的 completed 是 no-op。
+  const runningSteps = new Map<string, string[]>();
+  // 工具调用卡片（M5）：call_id -> 转写条目 id。tool_call 事件的
+  // start/end 靠它精确配对，天然免疫并行同名调用。
+  const toolCardsByCallId = new Map<string, string>();
+  let stepSeq = 0;
+  const assistantId = `a-${rid}`;
+  return (event, current) => {
+    switch (event.type) {
+      case "ping":
+        return current; // heartbeat — nothing to render
+      case "step": {
+        // 审批门暂停预告（#26/#62）：name="approval" 只有 running 形态，
+        // 没有配对的 completed——不进 FIFO，建专属「等待审批」chip；
+        // 随后跟随 done(termination="paused")。
+        if (event.name === "approval") {
+          state.approvalDetail = event.detail ?? state.approvalDetail;
+          return [
+            ...current,
+            {
+              id: `t-${rid}-${stepSeq++}`,
+              role: "tool",
+              name: "审批",
+              status: "paused" as const,
+              ...(event.detail ? { detail: event.detail } : {}),
+            },
+          ];
+        }
+        // running：该名字已有工具调用卡片在跑时跳过——卡片带参数与
+        // 结果（step 的信息超集），不生成重复 chip。
+        if (event.status === "running") {
+          const running = runningSteps.get(event.name);
+          if (running && running.length > 0) return current;
+          const stepId = `t-${rid}-${stepSeq++}`;
+          const queue = runningSteps.get(event.name) ?? [];
+          queue.push(stepId);
+          runningSteps.set(event.name, queue);
+          return [
+            ...current,
+            {
+              id: stepId,
+              role: "tool",
+              name: event.name,
+              status: "running",
+              ...(event.detail ? { detail: event.detail } : {}),
+            },
+          ];
+        }
+        // completed / error 只落到该名字 FIFO 队列的队首：并行同名
+        // 调用时按事件到达顺序配对；队列里若是工具调用卡片，其终态
+        // 已由 tool_call end 事件写入（end 会把自己摘出队列），此处
+        // 幂等；若 end 因异常路径缺失，此处兜底收尾。
+        const queue = runningSteps.get(event.name);
+        if (!queue || queue.length === 0) return current;
+        const runningId = queue.shift()!;
+        if (queue.length === 0) runningSteps.delete(event.name);
+        return current.map((m) =>
+          m.id === runningId && m.role === "tool"
+            ? {
+                ...m,
+                status: event.status,
+                ...(event.status === "completed" && event.detail
+                  ? { result: event.detail }
+                  : {}),
+              }
+            : m,
+        );
+      }
+      case "tool_call": {
+        if (event.phase === "start") {
+          const entryId = `tc-${rid}-${event.call_id}`;
+          toolCardsByCallId.set(event.call_id, entryId);
+          const queue = runningSteps.get(event.name) ?? [];
+          queue.push(entryId);
+          runningSteps.set(event.name, queue);
+          return [
+            ...current,
+            {
+              id: entryId,
+              role: "tool",
+              name: event.name,
+              status: "running" as const,
+              call_id: event.call_id,
+              ...(event.args ? { args: event.args } : {}),
+            },
+          ];
+        }
+        // end：按 call_id 精确回填终态（status/result/耗时/错误），
+        // 并把该条目从 step 的 FIFO 队列摘除。
+        const entryId = toolCardsByCallId.get(event.call_id);
+        if (!entryId) return current;
+        toolCardsByCallId.delete(event.call_id);
+        const queue = runningSteps.get(event.name);
+        if (queue) {
+          const at = queue.indexOf(entryId);
+          if (at >= 0) queue.splice(at, 1);
+          if (queue.length === 0) runningSteps.delete(event.name);
+        }
+        const status = event.status === "ok" ? "completed" : "error";
+        return current.map((m) =>
+          m.id === entryId && m.role === "tool"
+            ? {
+                ...m,
+                status: status as "completed" | "error",
+                ...(event.result ? { result: event.result } : {}),
+                ...(event.duration_ms !== null
+                  ? { duration_ms: event.duration_ms }
+                  : {}),
+                ...(event.error ? { error: event.error } : {}),
+              }
+            : m,
+        );
+      }
+      case "sources": {
+        // 工具发布的引用来源：作为独立转写条目渲染在回复旁。
+        if (!event.sources || event.sources.length === 0) return current;
+        return [
+          ...current,
+          {
+            id: `s-${rid}-${stepSeq++}`,
+            role: "sources" as const,
+            sources: event.sources
+              .filter((s) => s.title)
+              .map((s) => ({
+                title: s.title,
+                ...(s.url ? { url: s.url } : {}),
+              })),
+          },
+        ];
+      }
+      case "delta":
+        if (!state.firstDeltaSeen) {
+          state.firstDeltaSeen = true;
+          current = [
+            ...current,
+            { id: assistantId, role: "assistant", content: "" },
+          ];
+        }
+        return current.map((m) =>
+          m.id === assistantId && m.role === "assistant"
+            ? { ...m, content: m.content + event.content }
+            : m,
+        );
+      case "plan":
+        // planner plan 事件：整表替换语义——单条卡片按轮 id 复用。
+        {
+          const entryId = `p-${rid}`;
+          const entry: UiMessage = {
+            id: entryId,
+            role: "plan",
+            status: event.status,
+            tasks: event.plan,
+            ...(event.detail ? { detail: event.detail } : {}),
+          };
+          const at = current.findIndex((m) => m.id === entryId);
+          if (at >= 0) {
+            const next = [...current];
+            next[at] = entry;
+            return next;
+          }
+          return [...current, entry];
+        }
+      case "done":
+        // thread id 已在本轮开始时前置生成并同步到本地索引，后端回显的
+        // thread_id 与之一致，这里无需再处理；termination 驱动收尾状态。
+        if (event.termination === "paused") state.paused = true;
+        return current;
+      case "error":
+        state.backendErrored = true;
+        onError(event.message);
+        return current;
+    }
+  };
+}
+
+/** 流收尾：把仍在 "running" 的步骤标记为终态。流结束后不允许任何
+ * running 徽标存活；审批暂停轮的残留 running 是「等待审批」而非中断。 */
+function finalizeToolCards(
+  current: UiMessage[],
+  opts: { stopped: boolean; paused: boolean },
+): UiMessage[] {
+  return current.map((m) =>
+    m.role === "tool" && m.status === "running"
+      ? {
+          ...m,
+          status: opts.paused ? ("paused" as const) : ("error" as const),
+          detail: opts.paused ? "等待审批" : opts.stopped ? "已停止" : "已中断",
+        }
+      : m,
+  );
+}
+
+/** 从历史尾部解析待审批调用：取消轮的悬挂 tool_calls 在服务端落盘前被
+ * 剥除，因此历史尾部 assistant 的未配对发起方 = 审批门暂停（有意保留）。
+ * 从尾部向首扫，tool 结果行跳过，命中 assistant 即取其 tool_calls。 */
+function pendingCallsFromHistory(
+  messages: ThreadHistoryMessage[],
+): PendingApprovalCall[] {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "tool") continue;
+    if (m.role === "assistant") {
+      return (m.tool_calls ?? [])
+        .filter((tc) => tc.id)
+        .map((tc) => ({
+          callId: tc.id,
+          name: tc.name,
+          ...(tc.args ? { args: tc.args } : {}),
+        }));
+    }
+    break; // human：无悬挂
+  }
+  return [];
 }
 
 function readStorage(key: string): string | null {
@@ -261,6 +533,13 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   const streamingRef = useRef<Set<string>>(new Set());
   const [streamingTrigger, setStreamingTrigger] = useState(0);
 
+  // 审批门暂停登记（per thread）：暂停轮收尾时写入（待审批调用从历史尾
+  // 悬挂 tool_calls 解析），resume 开跑时清除，线程切换时镜像到 pausedInfo。
+  const pausedTurnsRef = useRef<Map<string, PendingApproval>>(new Map());
+  const [pausedInfo, setPausedInfo] = useState<
+    (PendingApproval & { threadId: string }) | null
+  >(null);
+
   const updateApiUrl = useCallback((value: string) => {
     setApiUrl(value);
     writeStorage(API_URL_STORAGE_KEY, value);
@@ -285,6 +564,14 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   useEffect(() => {
     activeThreadRef.current = threadId;
   }, [threadId]);
+
+  // pausedTurnsRef → 渲染态镜像：登记变化/线程切换时调用（活跃线程的
+  // 待审批信息供审批卡渲染）。
+  const syncPausedInfo = useCallback(() => {
+    const id = activeThreadRef.current;
+    const pending = id ? pausedTurnsRef.current.get(id) : undefined;
+    setPausedInfo(pending ? { ...pending, threadId: id! } : null);
+  }, []);
   // sendMessage 的稳定闭包里读不到最新 threadId（它不在依赖数组里），
   // 必须走 ref：否则"新建对话"后发的第一轮会被路由进旧线程的转写。
   const threadIdRef = useRef<string | null>(null);
@@ -327,6 +614,95 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   const finalApiUrl = apiUrl;
   const finalModule = module;
 
+  // 收尾对账（原 sendMessage 内嵌函数提为 provider 级）：invoke 轮与
+  // resume 轮共用。force（重新生成轮）时远端无条件接管；否则只在远端
+  // 更完整时覆盖——本地转写带步骤徽标、所见即所得，被它短的后端快照
+  // 没有理由抹掉它；其余情况做树锚点回填（ADR-013）。
+  const reconcileFromBackend = useCallback(
+    async (id: string, mod: string, opts?: { force?: boolean }) => {
+      try {
+        const history = await fetchThreadHistory({
+          apiUrl: finalApiUrl,
+          module: mod,
+          threadId: id,
+        });
+        const remote = replayToUiMessages(history.messages);
+        // 若用户在对账返回前删掉了该线程，transcriptsRef 里没有它则跳过。
+        if (!transcriptsRef.current.has(id)) return;
+        const current = transcriptsRef.current.get(id) ?? [];
+        if (opts?.force || remote.length > current.length) {
+          setTranscript(id, remote);
+          const t = getThread(id);
+          if (t) {
+            saveThread({
+              threadId: id,
+              title: t.title,
+              module: t.module,
+              updatedAt: Date.now(),
+              messages: remote,
+              status: t.status ?? "ended",
+            });
+          }
+          return;
+        }
+        const merged = mergeTreeAnchors(current, remote);
+        if (merged) {
+          setTranscript(id, merged);
+          const t = getThread(id);
+          if (t) {
+            saveThread({
+              threadId: id,
+              title: t.title,
+              module: t.module,
+              updatedAt: Date.now(),
+              messages: merged,
+              status: t.status ?? "ended",
+            });
+          }
+        }
+      } catch {
+        // 对账失败不打扰用户：本地转写已经是完整所见即所得。
+      }
+    },
+    [finalApiUrl, getThread, saveThread, setTranscript],
+  );
+
+  // 暂停轮登记：计划门（审批 step detail="plan"）用保留键 "plan"；
+  // 工具门从历史尾 assistant 的悬挂 tool_calls 解析待审批调用（404 掩蔽
+  // 的非属主线程拉不到历史 → calls 空，UI 退化为直接继续/放弃）。
+  const registerPausedTurn = useCallback(
+    async (id: string, mod: string, approvalDetail: string | null) => {
+      let pending: PendingApproval;
+      if (approvalDetail === "plan") {
+        pending = {
+          kind: "plan",
+          detail: approvalDetail,
+          calls: [{ callId: "plan" }],
+        };
+      } else {
+        let calls: PendingApprovalCall[] = [];
+        try {
+          const history = await fetchThreadHistory({
+            apiUrl: finalApiUrl,
+            module: mod,
+            threadId: id,
+          });
+          calls = pendingCallsFromHistory(history.messages);
+        } catch {
+          // 历史拉取失败：登记空 calls（detail 兜底展示），resume 仍可用。
+        }
+        pending = {
+          kind: "tool",
+          ...(approvalDetail ? { detail: approvalDetail } : {}),
+          calls,
+        };
+      }
+      pausedTurnsRef.current.set(id, pending);
+      syncPausedInfo();
+    },
+    [finalApiUrl, syncPausedInfo],
+  );
+
   // 打开首页即恢复最后活跃会话（localStorage 里只有无敏感的 thread id；
   // 对话内容本身由后端 checkpointer 持有，localStorage 没有就走历史
   // 恢复路径拉取）。注意不覆盖 URL 参数/构建时 env 的初始值——它们的
@@ -347,6 +723,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   useEffect(() => {
     const target = threadId ?? null;
     setError(null);
+    syncPausedInfo();
     if (!target) {
       setMessages([]);
       return;
@@ -379,7 +756,28 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           threadId: target,
         });
         if (cancelled) return;
-        const remote = replayToUiMessages(history.messages);
+        const rawRemote = replayToUiMessages(history.messages);
+        // 云端/持久化的暂停线程探测（best-effort）：取消轮的悬挂 tool_calls
+        // 在服务端落盘前剥除，因此历史尾部 assistant 的未配对发起方 =
+        // 审批门暂停（快照有意保留）。把对应 running 卡转成「等待审批」
+        // 并登记，供审批卡与 resume 使用；不计入对账语义。
+        const dangling = pendingCallsFromHistory(history.messages);
+        const remote =
+          dangling.length > 0
+            ? (rawRemote.map((m) =>
+                m.role === "tool" && m.status === "running"
+                  ? {
+                      ...m,
+                      status: "paused" as const,
+                      ...(m.detail ? {} : { detail: "等待审批" }),
+                    }
+                  : m,
+              ) as UiMessage[])
+            : rawRemote;
+        if (dangling.length > 0) {
+          pausedTurnsRef.current.set(target, { kind: "tool", calls: dangling });
+          syncPausedInfo();
+        }
         // 后端是该线程转写的权威来源，但只在"不少于本地"时覆盖：被停止
         // 的轮次后端可能只有更短的历史，不能拿旧快照抹掉用户刚看到的
         // 半截回复。强制重载（分支切换）例外——后端路径无条件接管。
@@ -423,6 +821,31 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           });
         }
       }
+      // planner 模块的历史回放补渲染：拉当前计划卡（非 planner 模块 404/503
+      // → null 静默跳过）。转写里已有 plan 卡（本会话流式产生的 p-{rid}）
+      // 时不覆盖——流内卡比端点快照更新鲜。
+      try {
+        const plan = await fetchThreadPlan({
+          apiUrl: finalApiUrl,
+          module: mod,
+          threadId: target,
+        });
+        if (cancelled || !plan || plan.tasks.length === 0) return;
+        const cur = transcriptsRef.current.get(target);
+        if (!cur || cur.some((m) => m.role === "plan")) return;
+        const entry: UiMessage = {
+          id: "p-history",
+          role: "plan",
+          status: "progress",
+          tasks: plan.tasks,
+          ...(plan.cursor > 0 || plan.replans > 0
+            ? { detail: `cursor=${plan.cursor} · replans=${plan.replans}` }
+            : {}),
+        };
+        setTranscript(target, [...cur, entry]);
+      } catch {
+        // 计划拉取失败不打扰用户（回放补渲染是尽力而为）。
+      }
     })();
     return () => {
       cancelled = true;
@@ -436,6 +859,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     finalModule,
     setTranscript,
     reloadCounter,
+    syncPausedInfo,
   ]);
 
   const sendMessage = useCallback(
@@ -513,21 +937,27 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         });
       }
 
-      let firstDeltaSeen = false;
-      // 同名步骤在同一轮里可以出现多次（agent → tools → agent），而且
-      // 模型可以在一条消息里并行发多个同名工具调用（如两次 web_search），
-      // 各自的 running/completed 事件按到达顺序交错。按 name 单槽匹配会
-      // 互相覆盖：第二次 running 顶掉第一次的槽位，先完成的 completed
-      // 配到后启动的条目上，先启动的条目永远留在 running——收口时被误标
-      // "已中断"。因此每个 name 维护一个 FIFO 队列：running 入队，
-      // completed 出队，与事件到达顺序天然配对；没有对应 running 的
-      // completed 是 no-op。
-      const runningSteps = new Map<string, string[]>();
-      // 工具调用卡片（M5）：call_id -> 转写条目 id。tool_call 事件的
-      // start/end 靠它精确配对，天然免疫并行同名调用。
-      const toolCardsByCallId = new Map<string, string>();
-      const toolCardIds = new Set<string>();
-      let stepSeq = 0;
+      // 本轮事件处理状态：工厂形态（invoke 轮与 resume 轮共用同一映射，
+      // FIFO 配对/tool_call 配对语义见 createEventApplier）。
+      const turnState: TurnState = {
+        firstDeltaSeen: false,
+        backendErrored: false,
+        paused: false,
+        approvalDetail: null,
+      };
+      const applyEvent = createEventApplier(rid, turnState, (message) => {
+        if (activeThreadRef.current === turnThreadId) setError(message);
+        toast.error("agent-base 返回错误", {
+          description: (
+            <p>
+              <strong>{message}</strong>
+            </p>
+          ),
+          duration: 8000,
+          richColors: true,
+          closeButton: true,
+        });
+      });
 
       const controller = new AbortController();
       abortRefs.current.set(turnThreadId, controller);
@@ -536,9 +966,6 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       // 重新生成（ADR-013）：收尾以远端新活跃路径整体覆盖本地——本地
       // 转写里还留着被替换出路径的旧回复，对齐合并的语义不适用。
       const usedRegenerate = regenerate;
-      // 后端在流中返回 error 事件：本轮已废，但连接多半还会走到 done，
-      // catch 抓不到——单独记号，收口时归入"对话异常"。
-      let backendErrored = false;
       try {
         const events = invokeAgent({
           apiUrl: finalApiUrl,
@@ -571,7 +998,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
             richColors: true,
             closeButton: true,
           });
-          if (!firstDeltaSeen) {
+          if (!turnState.firstDeltaSeen) {
             // 断流兜底：一个 token 都没收到时回滚这条 human 消息，
             // 否则界面留下永远没有回复的孤儿消息，重发还会重复。
             transcript = transcript.filter((m) => m.id !== humanId);
@@ -584,27 +1011,24 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         streamingRef.current.delete(turnThreadId);
         setStreamingTrigger((n) => n + 1); // 触发 isLoading 重算
         // 收尾：把仍在 "running" 的步骤标记为终态。流结束后不允许任何
-        // running 徽标存活（旧实现正是在这里留下永久"运行中"）。
-        const stopped = aborted;
-        transcript = transcript.map((m) =>
-          m.role === "tool" && m.status === "running"
-            ? {
-                ...m,
-                status: "error" as const,
-                detail: stopped ? "已停止" : "已中断",
-              }
-            : m,
-        );
+        // running 徽标存活（旧实现正是在这里留下永久"运行中"）；审批
+        // 暂停轮的残留 running 是「等待审批」而非中断。
+        transcript = finalizeToolCards(transcript, {
+          stopped: aborted,
+          paused: turnState.paused,
+        });
         setTranscript(turnThreadId, transcript);
 
         // 会话收尾状态：用户停止 = 终止；请求失败或后端报错 = 异常；
-        // 其余 = 正常结束（chat-agent 把这三类终态混在一个 finally 里
-        // 不区分，这里显式区分开，供侧栏/顶栏的状态点展示）。
+        // 审批门暂停 = 等待审批（后端持久态，刷新后可续跑）；其余 =
+        // 正常结束——显式区分开，供侧栏/顶栏的状态点展示。
         const finalStatus: ThreadStatus = aborted
           ? "terminated"
-          : failed || backendErrored
-            ? "error"
-            : "ended";
+          : turnState.paused
+            ? "paused"
+            : failed || turnState.backendErrored
+              ? "error"
+              : "ended";
 
         // Persist the thread (with its full transcript) so the history
         // sidebar can reopen it later. A fully rolled-back turn has nothing
@@ -636,241 +1060,29 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
           }
         }
 
-        // 正常完成的轮次：以后端 checkpointer 为权威做一次对账，替换本地
-        // 转写。这从根上治愈"本地视图与真实历史漂移"（停止/中断残留的
-        // 半截内容、丢步骤等）。被用户停止的轮次不对账——后端可能没有
-        // 本轮 checkpoint，对账会把用户刚看到的半截回复抹掉。
-        if (!aborted) {
-          void reconcileFromBackend(turnThreadId, turnModule);
+        // 审批门暂停轮：登记待审批项（悬挂调用 id 从历史尾部解析），供
+        // 审批卡与「继续执行」使用。不与后端对账——悬挂 tool_calls +
+        // pending_approval 快照不适用长度对账语义。
+        if (turnState.paused) {
+          void registerPausedTurn(
+            turnThreadId,
+            turnModule,
+            turnState.approvalDetail,
+          );
+        } else if (!aborted) {
+          // 正常完成的轮次：以后端 checkpointer 为权威做一次对账，替换本地
+          // 转写。这从根上治愈"本地视图与真实历史漂移"（停止/中断残留的
+          // 半截内容、丢步骤等）。被用户停止的轮次不对账——后端可能没有
+          // 本轮 checkpoint，对账会把用户刚看到的半截回复抹掉。
+          void reconcileFromBackend(turnThreadId, turnModule, {
+            force: usedRegenerate,
+          });
         }
       }
 
       // 失败时调用方会把草稿放回输入框；停止/成功不回填。
       return { ok: !failed, draft: text };
 
-      async function reconcileFromBackend(
-        id: string,
-        mod: string,
-      ): Promise<void> {
-        try {
-          const history = await fetchThreadHistory({
-            apiUrl: finalApiUrl,
-            module: mod,
-            threadId: id,
-          });
-          const remote = replayToUiMessages(history.messages);
-          // 重新生成的轮次：远端就是新的活跃路径，无条件接管本地视图。
-          if (usedRegenerate && transcriptsRef.current.has(id)) {
-            setTranscript(id, remote);
-            const current = getThread(id);
-            if (current) {
-              saveThread({
-                threadId: id,
-                title: current.title,
-                module: current.module,
-                updatedAt: Date.now(),
-                messages: remote,
-                status: current.status ?? "ended",
-              });
-            }
-            return;
-          }
-          // 轮次已结束（同线程串行）。只在后端历史比本地更完整时才覆盖：
-          // 本地转写带步骤徽标、所见即所得，比它短的后端快照没有理由
-          // 抹掉它；比它长说明本地确实缺了内容（唯一要治的漂移）。
-          // 若用户在对账返回前删掉了该线程，transcriptsRef 里没有它则跳过。
-          if (
-            remote.length > transcript.length &&
-            transcriptsRef.current.has(id)
-          ) {
-            setTranscript(id, remote);
-            const current = getThread(id);
-            if (current) {
-              // 重建一条干净的本地记录：不带 remote 标记（转写已在本地）。
-              // status 保留收尾时写入的终态——对账只修内容，不改状态。
-              saveThread({
-                threadId: id,
-                title: current.title,
-                module: current.module,
-                updatedAt: Date.now(),
-                messages: remote,
-                status: current.status ?? "ended",
-              });
-            }
-            return;
-          }
-          // 树锚点对账（ADR-013）：见模块级 mergeTreeAnchors——流式消息
-          // 本地没有 node_id（后端入树后才有），按角色序列对齐回填，
-          // 让最新消息立刻获得树交互（分岔/重命名/切换器），不必刷新。
-          if (transcriptsRef.current.has(id)) {
-            const merged = mergeTreeAnchors(transcript, remote);
-            if (merged) {
-              setTranscript(id, merged);
-              const current = getThread(id);
-              if (current) {
-                saveThread({
-                  threadId: id,
-                  title: current.title,
-                  module: current.module,
-                  updatedAt: Date.now(),
-                  messages: merged,
-                  status: current.status ?? "ended",
-                });
-              }
-            }
-          }
-        } catch {
-          // 对账失败不打扰用户：本地转写已经是完整所见即所得。
-        }
-      }
-
-      function applyEvent(
-        event: AgentBaseEvent,
-        current: UiMessage[],
-      ): UiMessage[] {
-        switch (event.type) {
-          case "ping":
-            return current; // heartbeat — nothing to render
-          case "step": {
-            // running：该名字已有工具调用卡片在跑时跳过——卡片带参数与
-            // 结果（step 的信息超集），不生成重复 chip。
-            if (event.status === "running") {
-              const running = runningSteps.get(event.name);
-              if (running && running.length > 0) return current;
-              const stepId = `t-${rid}-${stepSeq++}`;
-              const queue = runningSteps.get(event.name) ?? [];
-              queue.push(stepId);
-              runningSteps.set(event.name, queue);
-              return [
-                ...current,
-                {
-                  id: stepId,
-                  role: "tool",
-                  name: event.name,
-                  status: "running",
-                  ...(event.detail ? { detail: event.detail } : {}),
-                },
-              ];
-            }
-            // completed / error 只落到该名字 FIFO 队列的队首：并行同名
-            // 调用时按事件到达顺序配对；队列里若是工具调用卡片，其终态
-            // 已由 tool_call end 事件写入（end 会把自己摘出队列），此处
-            // 幂等；若 end 因异常路径缺失，此处兜底收尾。
-            const queue = runningSteps.get(event.name);
-            if (!queue || queue.length === 0) return current;
-            const runningId = queue.shift()!;
-            if (queue.length === 0) runningSteps.delete(event.name);
-            return current.map((m) =>
-              m.id === runningId
-                ? {
-                    ...m,
-                    status: event.status,
-                    ...(event.status === "completed" && event.detail
-                      ? { result: event.detail }
-                      : {}),
-                  }
-                : m,
-            );
-          }
-          case "tool_call": {
-            if (event.phase === "start") {
-              const entryId = `tc-${rid}-${event.call_id}`;
-              toolCardsByCallId.set(event.call_id, entryId);
-              toolCardIds.add(entryId);
-              const queue = runningSteps.get(event.name) ?? [];
-              queue.push(entryId);
-              runningSteps.set(event.name, queue);
-              return [
-                ...current,
-                {
-                  id: entryId,
-                  role: "tool",
-                  name: event.name,
-                  status: "running" as const,
-                  call_id: event.call_id,
-                  ...(event.args ? { args: event.args } : {}),
-                },
-              ];
-            }
-            // end：按 call_id 精确回填终态（status/result/耗时/错误），
-            // 并把该条目从 step 的 FIFO 队列摘除。
-            const entryId = toolCardsByCallId.get(event.call_id);
-            if (!entryId) return current;
-            toolCardsByCallId.delete(event.call_id);
-            toolCardIds.delete(entryId);
-            const queue = runningSteps.get(event.name);
-            if (queue) {
-              const at = queue.indexOf(entryId);
-              if (at >= 0) queue.splice(at, 1);
-              if (queue.length === 0) runningSteps.delete(event.name);
-            }
-            const status = event.status === "ok" ? "completed" : "error";
-            return current.map((m) =>
-              m.id === entryId
-                ? {
-                    ...m,
-                    status: status as "completed" | "error",
-                    ...(event.result ? { result: event.result } : {}),
-                    ...(event.duration_ms !== null
-                      ? { duration_ms: event.duration_ms }
-                      : {}),
-                    ...(event.error ? { error: event.error } : {}),
-                  }
-                : m,
-            );
-          }
-          case "sources": {
-            // 工具发布的引用来源：作为独立转写条目渲染在回复旁。
-            if (!event.sources || event.sources.length === 0) return current;
-            return [
-              ...current,
-              {
-                id: `s-${rid}-${stepSeq++}`,
-                role: "sources" as const,
-                sources: event.sources
-                  .filter((s) => s.title)
-                  .map((s) => ({
-                    title: s.title,
-                    ...(s.url ? { url: s.url } : {}),
-                  })),
-              },
-            ];
-          }
-          case "delta":
-            if (!firstDeltaSeen) {
-              firstDeltaSeen = true;
-              current = [
-                ...current,
-                { id: assistantId, role: "assistant", content: "" },
-              ];
-            }
-            return current.map((m) =>
-              m.id === assistantId && m.role === "assistant"
-                ? { ...m, content: m.content + event.content }
-                : m,
-            );
-          case "done":
-            // thread id 已在本轮开始时前置生成并同步到 URL，后端回显的
-            // thread_id 与之一致，这里无需再处理。
-            return current;
-          case "error":
-            backendErrored = true;
-            if (activeThreadRef.current === turnThreadId) {
-              setError(event.message);
-            }
-            toast.error("agent-base 返回错误", {
-              description: (
-                <p>
-                  <strong>{event.message}</strong>
-                </p>
-              ),
-              duration: 8000,
-              richColors: true,
-              closeButton: true,
-            });
-            return current;
-        }
-      }
     },
     [
       finalApiUrl,
@@ -880,7 +1092,180 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       saveThread,
       setTranscript,
       updateThreadId,
+      reconcileFromBackend,
+      registerPausedTurn,
     ],
+  );
+
+  // 继续执行（#8 resume）：对审批门暂停的活跃线程调 resume 端点重新开流。
+  // 事件映射复用 createEventApplier 工厂（独立 rid：新卡的 id 空间不与
+  // 暂停轮冲突）；上一轮的「等待审批」卡不进续跑转写——批准的调用会由
+  // 新 tool_call 事件重新出卡，旧卡留着会出现同工具两张卡。
+  const resumeThread = useCallback(() => {
+    const id = threadIdRef.current;
+    if (!id || !finalApiUrl || !finalModule) return;
+    if (streamingRef.current.has(id)) return;
+    const pending = pausedTurnsRef.current.get(id);
+    if (!pending) return;
+    const seed =
+      transcriptsRef.current.get(id) ??
+      (activeThreadRef.current === id ? messagesRef.current : undefined) ??
+      getThreadMessages(id) ??
+      [];
+    streamingRef.current.add(id);
+    const rid = requestId();
+    let transcript: UiMessage[] = seed.filter(
+      (m) => !(m.role === "tool" && m.status === "paused"),
+    );
+    setTranscript(id, transcript);
+    setError(null);
+    pausedTurnsRef.current.delete(id);
+    syncPausedInfo();
+    const existing = getThread(id);
+    const turnModule = existing?.module ?? finalModule;
+    saveThread({
+      threadId: id,
+      title: existing?.title ?? id,
+      module: turnModule,
+      updatedAt: Date.now(),
+      messages: transcript,
+      status: "streaming",
+    });
+
+    const turnState: TurnState = {
+      firstDeltaSeen: false,
+      backendErrored: false,
+      paused: false,
+      approvalDetail: null,
+    };
+    const applyEvent = createEventApplier(rid, turnState, (message) => {
+      if (activeThreadRef.current === id) setError(message);
+      toast.error("agent-base 返回错误", {
+        description: (
+          <p>
+            <strong>{message}</strong>
+          </p>
+        ),
+        duration: 8000,
+        richColors: true,
+        closeButton: true,
+      });
+    });
+    const controller = new AbortController();
+    abortRefs.current.set(id, controller);
+    void (async () => {
+      let aborted = false;
+      let failed = false;
+      try {
+        for await (const event of resumeAgent({
+          apiUrl: finalApiUrl,
+          module: turnModule,
+          threadId: id,
+          requestId: rid,
+          signal: controller.signal,
+        })) {
+          transcript = applyEvent(event, transcript);
+          setTranscript(id, transcript);
+        }
+      } catch (err) {
+        aborted = err instanceof Error && err.name === "AbortError";
+        if (!aborted) {
+          failed = true;
+          const message = err instanceof Error ? err.message : String(err);
+          if (activeThreadRef.current === id) setError(message);
+          toast.error("请求 agent-base 失败", {
+            description: (
+              <p>
+                <strong>{message}</strong>
+              </p>
+            ),
+            duration: 8000,
+            richColors: true,
+            closeButton: true,
+          });
+        }
+        // 用户主动停止（aborted）：保留已生成的部分内容，不当作错误。
+      } finally {
+        abortRefs.current.delete(id);
+        streamingRef.current.delete(id);
+        setStreamingTrigger((n) => n + 1);
+        transcript = finalizeToolCards(transcript, {
+          stopped: aborted,
+          paused: turnState.paused,
+        });
+        setTranscript(id, transcript);
+        const finalStatus: ThreadStatus = aborted
+          ? "terminated"
+          : turnState.paused
+            ? "paused"
+            : failed || turnState.backendErrored
+              ? "error"
+              : "ended";
+        const t = getThread(id);
+        saveThread({
+          threadId: id,
+          title: t?.title ?? id,
+          module: turnModule,
+          updatedAt: Date.now(),
+          messages: transcript,
+          status: finalStatus,
+        });
+        // 续跑若再次撞审批门（计划门 replan 修订版再暂停），登记新一轮；
+        // 否则正常对账（与 invoke 轮同一语义）。
+        if (turnState.paused) {
+          void registerPausedTurn(id, turnModule, turnState.approvalDetail);
+        } else if (!aborted) {
+          void reconcileFromBackend(id, turnModule);
+        }
+      }
+    })();
+  }, [
+    finalApiUrl,
+    finalModule,
+    getThread,
+    getThreadMessages,
+    reconcileFromBackend,
+    registerPausedTurn,
+    setTranscript,
+    syncPausedInfo,
+  ]);
+
+  // 运行中插话（#7 steer）：仅活跃线程流进行中有效（与后端 404 掩蔽
+  // 语义一致的前置守卫）；结果以 toast 反馈。
+  const steer = useCallback(
+    async (content: string): Promise<void> => {
+      const id = threadIdRef.current;
+      if (!id || !finalApiUrl || !finalModule) return;
+      if (!streamingRef.current.has(id)) return;
+      try {
+        const result = await steerThreadApi({
+          apiUrl: finalApiUrl,
+          module: finalModule,
+          threadId: id,
+          content,
+          kind: "user",
+        });
+        if (result.queued) {
+          toast.success("插话已发送", {
+            description: "将在运行中的下一个步骤边界注入对话",
+            duration: 4000,
+          });
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        toast.error("插话发送失败", {
+          description: (
+            <p>
+              <strong>{message}</strong>
+            </p>
+          ),
+          duration: 8000,
+          richColors: true,
+          closeButton: true,
+        });
+      }
+    },
+    [finalApiUrl, finalModule],
   );
 
   const stop = useCallback(() => {
@@ -938,6 +1323,9 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     resetThread,
     reloadThread,
     isThreadStreaming,
+    pausedInfo,
+    resumeThread,
+    steer,
   };
 
   return (
