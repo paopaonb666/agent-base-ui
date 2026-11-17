@@ -680,8 +680,12 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   );
 
   // 暂停轮登记：计划门（审批 step detail="plan"）用保留键 "plan"；
-  // 工具门从历史尾 assistant 的悬挂 tool_calls 解析待审批调用（404 掩蔽
-  // 的非属主线程拉不到历史 → calls 空，UI 退化为直接继续/放弃）。
+  // 工具门优先读 GET plan 的 pending_kind/pending_calls（GUI 验收三轮
+  // R3-D2——planner execute 子任务内的暂停，tool_calls 在子任务私有转写
+  // 里、线程历史尾是 human，历史解析必然空 → 死卡三路死锁；后端随暂停
+  // 标记落盘的 calls 明细经 plan 端点权威透出）；回落历史悬挂 tool_calls
+  // 解析（chat 图暂停的既有形态，plan 端点 404/503 或无明细时）。404 掩
+  // 蔽的非属主线程两条路都拿不到 → calls 空，UI 退化为直接继续/放弃。
   const registerPausedTurn = useCallback(
     async (id: string, mod: string, approvalDetail: string | null) => {
       let pending: PendingApproval;
@@ -694,14 +698,31 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       } else {
         let calls: PendingApprovalCall[] = [];
         try {
-          const history = await fetchThreadHistory({
+          const plan = await fetchThreadPlan({
             apiUrl: finalApiUrl,
             module: mod,
             threadId: id,
           });
-          calls = pendingCallsFromHistory(history.messages);
+          if (plan?.pendingKind === "tool" && plan.pendingCalls?.length) {
+            calls = plan.pendingCalls.map((c) => ({
+              callId: String(c.id ?? ""),
+              ...(c.name ? { name: String(c.name) } : {}),
+            }));
+          }
         } catch {
-          // 历史拉取失败：登记空 calls（detail 兜底展示），resume 仍可用。
+          // plan 端点失败：回落历史解析（尽力而为）。
+        }
+        if (calls.length === 0) {
+          try {
+            const history = await fetchThreadHistory({
+              apiUrl: finalApiUrl,
+              module: mod,
+              threadId: id,
+            });
+            calls = pendingCallsFromHistory(history.messages);
+          } catch {
+            // 历史拉取失败：登记空 calls（detail 兜底展示），resume 仍可用。
+          }
         }
         pending = {
           kind: "tool",
@@ -788,14 +809,19 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
             : rawRemote;
         // 计划门待批信号：探测结果留给下方的暂停对账分支使用。
         let planPending = false;
+        // 工具门待批信号（R3-D2）：execute 子任务内的暂停快照尾无悬挂
+        // tool_calls，pending_calls 权威明细经 plan 端点透出。
+        let toolGatePending = false;
         if (dangling.length > 0) {
           pausedTurnsRef.current.set(target, { kind: "tool", calls: dangling });
           syncPausedInfo();
         } else {
-          // 计划门暂停的权威探测（GUI 验收缺陷 9）：工具门=历史尾悬挂
-          // tool_calls；计划门 marker 在快照 extras、历史消息不可见——
-          // status=paused 时查 GET plan 的 pending_approval（后端权威键），
-          // 恢复视图由此获得审批卡与「继续执行」入口。
+          // 计划门/工具门暂停的权威探测（GUI 验收缺陷 9 + 三轮 R3-D2）：
+          // 工具门=历史尾悬挂 tool_calls 或 plan 端点 pending_kind=tool
+          // （execute 子任务内暂停，明细 pending_calls）；计划门 marker 在
+          // 快照 extras、历史消息不可见——status=paused 时查 GET plan 的
+          // pending_approval / pending_kind（后端权威键），恢复视图由此
+          // 获得审批卡（计划门）或逐调用审批卡（工具门）与「继续执行」入口。
           if (thread?.status === "paused") {
             try {
               const plan = await fetchThreadPlan({
@@ -808,6 +834,16 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
                 pausedTurnsRef.current.set(target, {
                   kind: "plan",
                   calls: [{ callId: "plan" }],
+                });
+                syncPausedInfo();
+              } else if (plan?.pendingKind === "tool" && plan.pendingCalls?.length) {
+                toolGatePending = true;
+                pausedTurnsRef.current.set(target, {
+                  kind: "tool",
+                  calls: plan.pendingCalls.map((c) => ({
+                    callId: String(c.id ?? ""),
+                    ...(c.name ? { name: String(c.name) } : {}),
+                  })),
                 });
                 syncPausedInfo();
               }
@@ -828,7 +864,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         const storedLooksPaused =
           thread?.status === "paused" ||
           (stored ?? []).some((m) => m.role === "tool" && m.status === "paused");
-        if (storedLooksPaused && dangling.length === 0 && !planPending) {
+        if (storedLooksPaused && dangling.length === 0 && !planPending && !toolGatePending) {
           setTranscript(target, remote);
           if (thread && thread.status === "paused") {
             saveThread({

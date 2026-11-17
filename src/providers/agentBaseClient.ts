@@ -813,6 +813,12 @@ export interface ThreadPlan {
   /** 计划审批待决（后端 additive 键）：lastRun 终态 paused 且 marker
    * detail=plan——历史恢复的计划门暂停线程以此为准（GUI 验收缺陷 9）。 */
   pendingApproval?: boolean;
+  /** 暂停种类（GUI 验收三轮 R3-D2 additive 键）：plan=计划门；tool=工具
+   * 门（含 planner execute 子任务内撞门——快照尾无悬挂 tool_calls）。 */
+  pendingKind?: "plan" | "tool";
+  /** 工具门待审批调用明细 [{id,name}]（后端随暂停标记落盘并透出）——
+   * 恢复视图渲染逐调用批准/拒绝按钮的权威来源。 */
+  pendingCalls?: Array<{ id?: string | number; name?: string }>;
 }
 
 /** 读取线程当前计划。非 planner 模块（404/503）或任何失败 → null：
@@ -829,6 +835,8 @@ export async function fetchThreadPlan(args: {
     if (!response.ok) return null;
     const body = (await response.json()) as Partial<ThreadPlan> & {
       pending_approval?: boolean;
+      pending_kind?: "plan" | "tool";
+      pending_calls?: Array<{ id?: string | number; name?: string }>;
     };
     if (!Array.isArray(body.tasks)) return null;
     return {
@@ -852,6 +860,23 @@ export async function fetchThreadPlan(args: {
       // …)）——GUI 验收二轮修复：此前读 body.pendingApproval（camelCase）恒
       // undefined，计划门恢复探测从未拿到权威信号，恢复视图永远没有审批卡。
       pendingApproval: body.pending_approval === true,
+      // R3-D2 additive（wire snake_case 同款教训，直接按 wire 名读）：
+      // pending_kind=pendingKind、pending_calls=pendingCalls。
+      ...(body.pending_kind === "plan" || body.pending_kind === "tool"
+        ? { pendingKind: body.pending_kind }
+        : {}),
+      ...(Array.isArray(body.pending_calls) && body.pending_calls.length > 0
+        ? {
+            pendingCalls: (body.pending_calls as Array<Record<string, unknown>>).map(
+              (c) => ({
+                ...(c.id !== undefined && c.id !== null
+                  ? { id: c.id as string | number }
+                  : {}),
+                ...(typeof c.name === "string" ? { name: c.name } : {}),
+              }),
+            ),
+          }
+        : {}),
     };
   } catch {
     return null;
